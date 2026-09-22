@@ -129,6 +129,16 @@ def _plan_build_tower(turn: World) -> BigPlan:
     return BigPlan(BUILD_TOWER, count, "gold", gold, steps, True)
 
 
+def _opening_rockets_pending(turn: World) -> bool:
+    """三门火箭还没齐、场上武器也不满三座:这时先不领升级单。"""
+    from .brain import _tower_sites
+
+    if len(turn.weapons()) >= TOWER_CAP:
+        return False
+    standing = {unit.pos for unit in turn.weapons()}
+    return any(pos not in standing for pos in _tower_sites(turn))
+
+
 def _plan_build_wall(turn: World) -> BigPlan:
     from .brain import _gun_stand, _tower_sites, _wall_order
 
@@ -155,6 +165,8 @@ def _plan_build_wall(turn: World) -> BigPlan:
 
 
 def _plan_upgrade_tower(turn: World) -> BigPlan:
+    if _opening_rockets_pending(turn):
+        return BigPlan(UPGRADE_TOWER, 0, "gold", 0, (), False)
     rockets = [
         unit for unit in turn.weapons()
         if unit.kind == "rocket" and unit.level < 3
@@ -165,6 +177,8 @@ def _plan_upgrade_tower(turn: World) -> BigPlan:
 def _plan_upgrade_wall(turn: World) -> BigPlan:
     from .brain import _on_incoming_side
 
+    if _opening_rockets_pending(turn):
+        return BigPlan(UPGRADE_WALL, 0, "gold", 0, (), False)
     walls = [
         unit for unit in turn.walls()
         if unit.level < 3 and _on_incoming_side(unit.pos, turn)

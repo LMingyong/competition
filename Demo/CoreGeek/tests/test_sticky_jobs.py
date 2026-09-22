@@ -1,7 +1,7 @@
 """跨回合任务连续:采矿不换目标、失败重试、工种锁矿、开拓者冷却等待、夜间人塔配对粘住。"""
 
 import agent.tasks as tasks_mod
-from agent.brain import _tower_sites, decide
+from agent.brain import _gun_stand, _tower_sites, decide
 from agent.jobs import KIND_ACCEPT, KIND_MINE, KIND_MAN_TOWER, KIND_SHOP, KIND_TOWER, Job
 from agent.protocol import Pos, distance
 from agent.world import World
@@ -273,31 +273,112 @@ def test_opening_workers_all_get_commands(make_payload):
 
 
 def test_opening_both_workers_walk_toward_towers(make_payload):
-    """开局 75 金:第一人去建炮,第二人领建墙并就近采石,不去远处铜矿。"""
+    """开局 75 金:两名工人都去建火箭。建墙单可以先领着,但这一回合不能去采石。"""
     payload = _opening_no_buildings(fresh(make_payload(roundNo=1)))
     start1 = Pos(5, 23)
     start2 = Pos(10, 16)
     sites = _tower_sites(World.load(payload))
     response = decide(payload)
     _validate(response, payload)
-    assert action_of(response, WORKER_1) in {"move", "build"}
-    if action_of(response, WORKER_1) == "move":
-        step = move_pos(response, WORKER_1)
-        assert step is not None
-        assert min(distance(step, site) for site in sites) < min(
-            distance(start1, site) for site in sites
-        )
-    else:
-        raw = response[str(WORKER_1)]["targetPos"][0]
-        assert Pos(int(raw["x"]), int(raw["y"])) in sites
-    assert action_of(response, WORKER_2) in {"move", "collect"}
-    assert action_of(response, WORKER_2) != "build"
-    if action_of(response, WORKER_2) == "move":
-        step2 = move_pos(response, WORKER_2)
-        assert step2 is not None
-        assert distance(step2, Pos(22, 26)) >= distance(start2, Pos(22, 26))
+    for uid, start in ((WORKER_1, start1), (WORKER_2, start2)):
+        action = action_of(response, uid)
+        assert action in {"move", "build"}, (uid, action)
+        if action == "move":
+            step = move_pos(response, uid)
+            assert step is not None
+            assert min(distance(step, site) for site in sites) < min(
+                distance(start, site) for site in sites
+            ), (uid, start, step)
+        else:
+            raw = response[str(uid)]["targetPos"][0]
+            assert Pos(int(raw["x"]), int(raw["y"])) in sites
     assert tasks_mod.MEMORY.ticket_owner[WORKER_1] == "建炮"
     assert tasks_mod.MEMORY.ticket_owner[WORKER_2] == "建墙"
+
+
+def test_opening_six_turns_workers_move_or_build(make_payload):
+    """开局连续 8 回合:两名工人每回合都在移动或建造,不能空过,也不能踩炮手站位。"""
+    payload = _opening_no_buildings(fresh(make_payload(roundNo=1)))
+    where = {
+        WORKER_1: Pos(5, 23),
+        WORKER_2: Pos(10, 16),
+        PIONEER: Pos(10, 12),
+    }
+    stand = _gun_stand(World.load(payload))
+    next_id = 61000
+    for round_no in range(1, 9):
+        payload["roundNo"] = round_no
+        response = decide(payload)
+        _validate(response, payload)
+        for uid in (WORKER_1, WORKER_2):
+            action = action_of(response, uid)
+            assert action in {"move", "build"}, (
+                f"第 {round_no} 回合 {uid} 停在 {where[uid]}: {response.get(str(uid))}"
+            )
+            if action == "move":
+                step = move_pos(response, uid)
+                assert step is not None and step != where[uid]
+                assert step != stand
+                where[uid] = step
+                place(payload, uid, step.x, step.y)
+            else:
+                raw = response[str(uid)]["targetPos"][0]
+                assert response[str(uid)]["name"] in {"gatling", "railgun", "rocket"}
+                payload["teamOur"]["roles"].append({
+                    "id": next_id,
+                    "pos": {"x": int(raw["x"]), "y": int(raw["y"])},
+                    "roleType": response[str(uid)]["name"],
+                    "health": 1000,
+                    "attackPower": 20,
+                    "attackRange": 4,
+                    "level": 1,
+                    "backPackCapability": 0,
+                    "backpack": [],
+                })
+                next_id += 1
+                payload["teamOur"]["goldNum"] -= 25
+        pioneer = response.get(str(PIONEER))
+        if pioneer and pioneer.get("action") == "move":
+            step = move_pos(response, PIONEER)
+            if step is not None:
+                where[PIONEER] = step
+                place(payload, PIONEER, step.x, step.y)
+        payload["lastRoundRoleActionResults"] = {
+            str(uid): True for uid in response
+        }
+    built = {
+        (role["pos"]["x"], role["pos"]["y"])
+        for role in payload["teamOur"]["roles"]
+        if role.get("roleType") == "rocket"
+    }
+    assert built == {(9, 24), (9, 22), (8, 22)}
+
+
+def test_worker_on_unbuilt_rocket_steps_off(make_payload):
+    """人站在还没建成的最外侧火箭上时,必须走开,不能空过。"""
+    payload = _opening_no_buildings(fresh(make_payload(roundNo=4)))
+    payload["teamOur"]["goldNum"] = 25
+    for index, (x, y) in enumerate(((9, 24), (9, 22))):
+        payload["teamOur"]["roles"].append({
+            "id": 62000 + index,
+            "pos": {"x": x, "y": y},
+            "roleType": "rocket",
+            "health": 1000,
+            "attackPower": 20,
+            "attackRange": 4,
+            "level": 1,
+            "backPackCapability": 0,
+            "backpack": [],
+        })
+    place(payload, WORKER_1, 8, 22, backpack=[])
+    place(payload, WORKER_2, 4, 4, backpack=[])
+    response = decide(payload)
+    _validate(response, payload)
+    assert action_of(response, WORKER_1) == "move"
+    step = move_pos(response, WORKER_1)
+    assert step is not None
+    assert step != Pos(8, 22)
+    assert step != Pos(9, 23)
 
 
 def test_locked_tower_spend_updates_gold_for_next_worker(make_payload):
