@@ -174,6 +174,67 @@ def test_recall_gunner_walks_toward_pocket(make_payload):
     assert distance(step, stand) < distance(Pos(6, 6), stand)
 
 
+def test_night_only_one_fires_and_others_stay_off_stand(make_payload):
+    """夜里仍只有一人开火;另外两人走向站位背后,不占中间空地。"""
+    payload = fresh(make_payload(roundNo=85, phaseTask=""))
+    cells = ((12, 24), (12, 22), (13, 22))
+    for unit_id, (x, y) in zip((GATLING, RAILGUN, ROCKET), cells):
+        place(
+            payload, unit_id, x, y,
+            roleType="rocket", cooldown=0, level=1,
+            attackRange=10, attackPower=20, health=1000,
+        )
+    place(payload, WORKER_1, 12, 23, backpack=[], health=220)
+    place(payload, WORKER_2, 4, 4, backpack=[], health=220)
+    place(payload, PIONEER, 5, 5, backpack=["Medicine"], health=200)
+    payload["robot"] = _robots((20, 16))
+    response = decide(payload)
+    _validate(response, payload)
+    attacks = [cmd for cmd in response.values() if cmd["action"] == "attack"]
+    assert len(attacks) == 1
+    assert attacks[0]["controllerId"] == str(WORKER_1)
+    stand = Pos(12, 23)
+    backs = (Pos(9, 24), Pos(9, 23))
+    for uid, start in ((WORKER_2, Pos(4, 4)), (PIONEER, Pos(5, 5))):
+        step = move_pos(response, uid)
+        assert step != stand
+        assert step is not None
+        assert min(distance(step, cell) for cell in backs) < min(
+            distance(start, cell) for cell in backs
+        )
+
+
+def test_night_edge_mine_continues_without_taking_stand(make_payload):
+    """夜里已有边缘采矿且不挡炮手时可以继续,非炮手不去站位。"""
+    import agent.tasks as tasks_mod
+    from agent.jobs import KIND_MINE, Job
+
+    payload = fresh(make_payload(roundNo=85, phaseTask=""))
+    cells = ((12, 24), (12, 22), (13, 22))
+    for unit_id, (x, y) in zip((GATLING, RAILGUN, ROCKET), cells):
+        place(
+            payload, unit_id, x, y,
+            roleType="rocket", cooldown=0, level=1,
+            attackRange=10, attackPower=20, health=1000,
+        )
+    place(payload, WORKER_1, 12, 23, backpack=[], health=220)
+    place(payload, WORKER_2, 8, 3, backpack=[], health=220)
+    place(payload, PIONEER, 5, 5, backpack=["Medicine"], health=200)
+    tasks_mod.MEMORY.jobs[WORKER_2] = Job(
+        kind=KIND_MINE, target=Pos(7, 2), name="copper", started=80,
+    )
+    payload["robot"] = _robots((20, 16))
+    response = decide(payload)
+    _validate(response, payload)
+    attacks = [cmd for cmd in response.values() if cmd["action"] == "attack"]
+    assert len(attacks) == 1
+    assert attacks[0]["controllerId"] == str(WORKER_1)
+    assert action_of(response, WORKER_2) == "collect"
+    target = response[str(WORKER_2)]["targetPos"][0]
+    assert (target["x"], target["y"]) == (7, 2)
+    assert move_pos(response, PIONEER) != Pos(12, 23)
+
+
 def test_night_pioneer_with_phase_task_does_not_take_the_gun(make_payload):
     """有工人能操炮时,开拓者不必开火;同一回合仍然只有一门攻击。"""
     payload = fresh(make_payload(roundNo=85, phaseTask="请阅读task_1_alpha.md，获取任务信息"))

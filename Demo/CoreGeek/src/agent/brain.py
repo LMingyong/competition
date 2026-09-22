@@ -61,7 +61,7 @@ from .world import HERO_MAX_HP, World, backpack_item, count_item
 
 TOWER_LOADOUT = ("rocket", "rocket", "rocket")
 STONE_KEEP = 4
-RECALL_ROUNDS = 5
+RECALL_ROUNDS = 7
 RECALL_FROM = DAY_ROUNDS - RECALL_ROUNDS + 1
 WALL_FROM = 30
 EDGE_MINE_MAX = 4
@@ -117,15 +117,26 @@ def _day(
     builds_left = max(0, 3 - len(turn.weapons()))
     execute_cmd = ""
     prompt = ""
+    _pin_recall_gunner(turn, memory)
+    handled: set[int] = set()
+    # 回防窗口先走炮手,占住站位;另外两人再去边缘,避免跟着抢炮位。
+    if _in_recall(turn):
+        gunner = _select_gunner(turn, list(turn.controllable()), memory)
+        if gunner is not None and gunner.kind == "worker":
+            gold_left, builds_left = _worker_day(
+                turn, gunner, sites, free_towers, free_walls, claimed,
+                commands, gold_left, builds_left, memory,
+            )
+            handled.add(gunner.unit_id)
 
     pioneer = turn.pioneer()
-    if pioneer is not None:
+    if pioneer is not None and pioneer.unit_id not in handled:
         execute_cmd, prompt = _pioneer_day(
             turn, pioneer, memory, claimed, commands,
         )
 
     for role in turn.workers():
-        if role.unit_id in commands:
+        if role.unit_id in commands or role.unit_id in handled:
             continue
         gold_left, builds_left = _worker_day(
             turn, role, sites, free_towers, free_walls, claimed,
@@ -151,22 +162,12 @@ def _worker_day(
     if _try_upgrade_or_fix(turn, role, commands):
         return gold_left, builds_left
     if _should_home(turn, role, memory):
-        if walls_missing and count_item(role, WALL_MATERIAL):
-            for site in list(walls_missing):
-                if site in claimed or distance(role.pos, site) > 1 or role.pos == site:
-                    continue
-                if _build_or_walk(turn, role, site, WALL, claimed, commands):
-                    if (
-                        role.unit_id in commands
-                        and commands[role.unit_id]["action"] == "build"
-                    ):
-                        walls_missing.remove(site)
-                    return gold_left, builds_left
-        _keep_job(
-            memory, role, KIND_RECALL, target=_recall_target(turn),
-            round_no=turn.round_no,
-        )
         _recall_to_tower(turn, role, claimed, commands, memory)
+        return gold_left, builds_left
+    # 回防窗口优先于已锁的白天工单,但只拉走炮手。
+    # 另外两人改去边缘采矿,不继续往敌人一侧砌墙,也不占站位。
+    if _should_edge_mine(turn, role, memory):
+        _run_day_edge(turn, role, claimed, commands, memory)
         return gold_left, builds_left
 
     # 已派的单子没做完就继续:走到同一格,到了才 collect/build。
@@ -383,11 +384,139 @@ def _try_weapon_upgrade_shop(
 
 
 def _should_home(turn: World, role: Unit, memory) -> bool:
-    return _in_recall(turn)
+    """入夜前的回防窗口里,只有选定的那一名炮手回家。"""
+    return _in_recall(turn) and _is_gunner(turn, role, memory)
 
 
 def _should_edge_mine(turn: World, role: Unit, memory) -> bool:
+    """回防窗口里不操炮的人去边缘采矿。夜里仅继续已有的边缘矿,且不挡炮手。"""
+    if _is_gunner(turn, role, memory) and (_in_recall(turn) or not turn.is_day):
+        return False
+    if _in_recall(turn):
+        return True
+    if turn.is_day:
+        return False
+    job = get_job(memory, role.unit_id)
+    if job is None or job.kind != KIND_MINE or job.target is None:
+        return False
+    if not _is_edge_mine(turn, job.target):
+        return False
+    return not _blocks_gunner(turn, role, job.target)
+
+
+def _pin_recall_gunner(turn: World, memory) -> None:
+    """回防一开始就定下炮手,这 7 回合不再换人。"""
+    if not _in_recall(turn):
+        return
+    gunner = _select_gunner(turn, list(turn.controllable()), memory)
+    if gunner is None:
+        return
+    if _pattern_ready(turn):
+        _keep_gunner(memory, gunner, turn, _gun_stand(turn), 0)
+        return
+    weapons = turn.weapons()
+    if weapons:
+        tower = min(
+            weapons,
+            key=lambda unit: (distance(gunner.pos, unit.pos), unit.unit_id),
+        )
+        _keep_gunner(memory, gunner, turn, tower.pos, tower.unit_id)
+        return
+    _keep_gunner(memory, gunner, turn, _recall_target(turn), 0)
+
+
+def _blocks_gunner(turn: World, role: Unit, target: Pos) -> bool:
+    stand = _gun_stand(turn)
+    if stand is None:
+        return False
+    if role.pos == stand or target == stand:
+        return True
+    return distance(target, stand) <= 1 and distance(role.pos, stand) <= 1
+
+
+def _segment_crosses_center(turn: World, start: Pos, goal: Pos) -> bool:
+    """去小贩的直线是否穿过地图中央。中央那一格本身也算穿过。"""
+    center = _map_center(turn)
+    if max(abs(goal.x - center.x), abs(goal.y - center.y)) <= 1:
+        return True
+    steps = max(abs(goal.x - start.x), abs(goal.y - start.y))
+    for index in range(1, steps):
+        x = start.x + (goal.x - start.x) * index // steps
+        y = start.y + (goal.y - start.y) * index // steps
+        if max(abs(x - center.x), abs(y - center.y)) <= 1:
+            return True
     return False
+
+
+def _sell_in_safe_zone(
+    turn: World,
+    role: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    memory,
+) -> bool:
+    """背包满了只在不穿过地图中央时卖矿。小贩在中央就不要去。"""
+    vendor = turn.vendor()
+    if vendor is None or _segment_crosses_center(turn, role.pos, vendor):
+        return False
+    ore = _sellable_ore(role, turn, 0)
+    if ore is None:
+        return False
+    _keep_job(
+        memory, role, KIND_SELL, target=vendor, round_no=turn.round_no,
+    )
+    if turn.adjacent_to_zone(role, vendor):
+        name, num = ore
+        commands[role.unit_id] = sell_command(name, num)
+        return True
+    return _walk_adjacent(turn, role, vendor, claimed, commands)
+
+
+def _hold_near_edge(
+    turn: World,
+    role: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    memory,
+) -> bool:
+    """卖不了就停在边缘矿旁,不往地图中央走,也不去炮位。"""
+    taken = claimed_targets(memory, role.unit_id)
+    job = get_job(memory, role.unit_id)
+    mines = dict(turn.all_mines())
+    if (
+        job is not None
+        and job.kind == KIND_MINE
+        and job.target is not None
+        and job.target in mines
+        and _is_edge_mine(turn, job.target)
+    ):
+        target = job.target
+    else:
+        picked = _pick_edge_mine(turn, role, claimed, taken)
+        if picked is None:
+            return False
+        target, kind = picked
+        _keep_job(
+            memory, role, KIND_MINE, target=target, name=kind,
+            round_no=turn.round_no,
+        )
+    if role.pos != target and distance(role.pos, target) <= 1:
+        return True
+    return _walk_adjacent(turn, role, target, claimed, commands)
+
+
+def _run_day_edge(
+    turn: World,
+    role: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    memory,
+) -> bool:
+    if role.backpack_full:
+        if _sell_in_safe_zone(turn, role, claimed, commands, memory):
+            return True
+        return _hold_near_edge(turn, role, claimed, commands, memory)
+    return _run_edge_mine(turn, role, claimed, commands, memory)
 
 
 def _edge_distance(turn: World, pos: Pos) -> int:
@@ -409,7 +538,7 @@ def _pick_edge_mine(
     metals: list[tuple[Pos, str]] = []
     others: list[tuple[Pos, str]] = []
     for pos, kind in turn.all_mines():
-        if pos in blocked:
+        if pos in blocked or not _is_edge_mine(turn, pos):
             continue
         if kind in ("copper", "iron"):
             metals.append((pos, kind))
@@ -734,13 +863,25 @@ def _recall_to_tower(
     commands: dict[int, dict[str, Any]],
     memory=None,
 ) -> bool:
+    # 入夜前不把人拉上站位。回防窗口里也只有炮手走上站位。
+    if turn.is_day and not _in_recall(turn) and _pattern_ready(turn):
+        return False
+    if (
+        turn.is_day
+        and _in_recall(turn)
+        and memory is not None
+        and not _is_gunner(turn, role, memory)
+    ):
+        return False
     if memory is not None and _pattern_ready(turn):
-        if _is_gunner(turn, role, memory):
+        if _is_gunner(turn, role, memory) and (not turn.is_day or _in_recall(turn)):
             stand = _gun_stand(turn)
             if stand is None:
                 return False
             return _walk_onto(turn, role, stand, claimed, commands)
-        return _park_behind(turn, role, claimed, commands)
+        if not turn.is_day:
+            return _park_behind(turn, role, claimed, commands)
+        return False
     weapons = turn.weapons()
     if weapons:
         tower = min(
@@ -884,11 +1025,10 @@ def _pioneer_day(
         _keep_job(memory, role, KIND_PHASE, round_no=turn.round_no)
         return _run_task(turn, role, memory, claimed, commands)
     if _should_home(turn, role, memory):
-        _keep_job(
-            memory, role, KIND_RECALL, target=_recall_target(turn),
-            round_no=turn.round_no,
-        )
         _recall_to_tower(turn, role, claimed, commands, memory)
+        return "", _maybe_prompt(turn, memory)
+    if _should_edge_mine(turn, role, memory):
+        _run_day_edge(turn, role, claimed, commands, memory)
         return "", _maybe_prompt(turn, memory)
     job = get_job(memory, role.unit_id)
     if job is not None and job.target is not None and distance(role.pos, job.target) > 1:
@@ -1128,6 +1268,7 @@ def _man_battery(
         _keep_gunner(memory, role, turn, stand, 0)
         _walk_onto(turn, role, stand, claimed, commands)
         return
+    claimed.add(stand)
     _fire_one(turn, role, memory, commands, stand)
 
 
@@ -1205,6 +1346,11 @@ def _night(
         if _try_night_item(turn, role, commands):
             busy.add(role.unit_id)
             continue
+        if _should_edge_mine(turn, role, memory) and _run_edge_mine(
+            turn, role, claimed, commands, memory,
+        ):
+            busy.add(role.unit_id)
+            continue
         if _pattern_ready(turn):
             _park_behind(turn, role, claimed, commands)
     if not prompt:
@@ -1243,6 +1389,17 @@ def _fill_idle(turn: World, memory, commands: dict[int, dict[str, Any]]) -> None
         if any(distance(role.pos, tower.pos) <= 1 for tower in turn.weapons()):
             continue
         if turn.is_day and role.kind == "pioneer" and _near_own_task(turn, role):
+            continue
+        if turn.is_day and not _in_recall(turn):
+            if _pattern_ready(turn):
+                continue
+            _recall_to_tower(turn, role, claimed, commands, memory)
+            continue
+        if not _is_gunner(turn, role, memory):
+            if not turn.is_day and _pattern_ready(turn):
+                _park_behind(turn, role, claimed, commands)
+            elif not turn.is_day:
+                _recall_to_tower(turn, role, claimed, commands, memory)
             continue
         _recall_to_tower(turn, role, claimed, commands, memory)
 
