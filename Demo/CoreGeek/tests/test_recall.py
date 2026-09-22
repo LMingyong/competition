@@ -1,5 +1,7 @@
 """入夜前 7 回合:只派一名炮手回口袋,另外两人去边缘采矿。"""
 
+import pytest
+
 import agent.tasks as tasks_mod
 from agent.brain import RECALL_FROM, RECALL_ROUNDS, _is_edge_mine, decide
 from agent.jobs import KIND_MAN_TOWER, KIND_MINE, KIND_WALL, Job
@@ -109,9 +111,10 @@ def test_round_63_still_before_recall_window(make_payload):
         assert move_pos(response, uid) != Pos(12, 23)
 
 
-def test_last_seven_rounds_one_gunner_others_edge_mine(make_payload):
-    """入夜前 7 回合:恰好一人走向站位,另外两人去边缘矿,不砌敌人一侧的墙。"""
-    payload = fresh(make_payload(roundNo=RECALL_FROM, phaseTask=""))
+@pytest.mark.parametrize("round_no", [64, 194, 324])
+def test_last_seven_rounds_one_gunner_others_edge_mine(make_payload, round_no):
+    """前三天入夜前 7 回合都一样:恰好一人走向站位,另外两人去边缘矿。"""
+    payload = fresh(make_payload(roundNo=round_no, phaseTask=""))
     _arm_pocket(payload)
     drop_walls(payload)
     gunner_start = Pos(15, 20)
@@ -124,10 +127,10 @@ def test_last_seven_rounds_one_gunner_others_edge_mine(make_payload):
     )
     place(payload, PIONEER, pioneer_start.x, pioneer_start.y, backpack=["Medicine"])
     tasks_mod.MEMORY.jobs[WORKER_1] = Job(
-        kind=KIND_MINE, target=Pos(22, 26), name="copper", started=RECALL_FROM,
+        kind=KIND_MINE, target=Pos(22, 26), name="copper", started=round_no,
     )
     tasks_mod.MEMORY.jobs[WORKER_2] = Job(
-        kind=KIND_WALL, target=Pos(13, 21), name="wall", started=RECALL_FROM,
+        kind=KIND_WALL, target=Pos(13, 21), name="wall", started=round_no,
     )
     response = decide(payload)
     _validate(response, payload)

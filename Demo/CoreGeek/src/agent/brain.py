@@ -389,19 +389,10 @@ def _should_home(turn: World, role: Unit, memory) -> bool:
 
 
 def _should_edge_mine(turn: World, role: Unit, memory) -> bool:
-    """回防窗口里不操炮的人去边缘采矿。夜里仅继续已有的边缘矿,且不挡炮手。"""
-    if _is_gunner(turn, role, memory) and (_in_recall(turn) or not turn.is_day):
+    """回防窗口里不操炮的两人去边缘采矿。夜里改停在基地背后,不再下矿。"""
+    if not _in_recall(turn):
         return False
-    if _in_recall(turn):
-        return True
-    if turn.is_day:
-        return False
-    job = get_job(memory, role.unit_id)
-    if job is None or job.kind != KIND_MINE or job.target is None:
-        return False
-    if not _is_edge_mine(turn, job.target):
-        return False
-    return not _blocks_gunner(turn, role, job.target)
+    return not _is_gunner(turn, role, memory)
 
 
 def _pin_recall_gunner(turn: World, memory) -> None:
@@ -423,15 +414,6 @@ def _pin_recall_gunner(turn: World, memory) -> None:
         _keep_gunner(memory, gunner, turn, tower.pos, tower.unit_id)
         return
     _keep_gunner(memory, gunner, turn, _recall_target(turn), 0)
-
-
-def _blocks_gunner(turn: World, role: Unit, target: Pos) -> bool:
-    stand = _gun_stand(turn)
-    if stand is None:
-        return False
-    if role.pos == stand or target == stand:
-        return True
-    return distance(target, stand) <= 1 and distance(role.pos, stand) <= 1
 
 
 def _segment_crosses_center(turn: World, start: Pos, goal: Pos) -> bool:
@@ -1346,13 +1328,8 @@ def _night(
         if _try_night_item(turn, role, commands):
             busy.add(role.unit_id)
             continue
-        if _should_edge_mine(turn, role, memory) and _run_edge_mine(
-            turn, role, claimed, commands, memory,
-        ):
-            busy.add(role.unit_id)
-            continue
-        if _pattern_ready(turn):
-            _park_behind(turn, role, claimed, commands)
+        # 夜里只有炮手占站位。其余人停到基地背后,不接着去边缘矿,也不挤进炮位。
+        _park_behind(turn, role, claimed, commands)
     if not prompt:
         prompt = _maybe_prompt(turn, memory)
     return execute_cmd, prompt
@@ -1396,10 +1373,8 @@ def _fill_idle(turn: World, memory, commands: dict[int, dict[str, Any]]) -> None
             _recall_to_tower(turn, role, claimed, commands, memory)
             continue
         if not _is_gunner(turn, role, memory):
-            if not turn.is_day and _pattern_ready(turn):
+            if not turn.is_day:
                 _park_behind(turn, role, claimed, commands)
-            elif not turn.is_day:
-                _recall_to_tower(turn, role, claimed, commands, memory)
             continue
         _recall_to_tower(turn, role, claimed, commands, memory)
 

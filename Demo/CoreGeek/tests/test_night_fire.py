@@ -204,8 +204,8 @@ def test_night_only_one_fires_and_others_stay_off_stand(make_payload):
         )
 
 
-def test_night_edge_mine_continues_without_taking_stand(make_payload):
-    """夜里已有边缘采矿且不挡炮手时可以继续,非炮手不去站位。"""
+def test_night_edge_miner_parks_behind_instead_of_mining(make_payload):
+    """夜里即使上一回合还在采边缘矿,也改停到基地背后,不占站位。"""
     import agent.tasks as tasks_mod
     from agent.jobs import KIND_MINE, Job
 
@@ -229,10 +229,16 @@ def test_night_edge_mine_continues_without_taking_stand(make_payload):
     attacks = [cmd for cmd in response.values() if cmd["action"] == "attack"]
     assert len(attacks) == 1
     assert attacks[0]["controllerId"] == str(WORKER_1)
-    assert action_of(response, WORKER_2) == "collect"
-    target = response[str(WORKER_2)]["targetPos"][0]
-    assert (target["x"], target["y"]) == (7, 2)
-    assert move_pos(response, PIONEER) != Pos(12, 23)
+    assert action_of(response, WORKER_2) != "collect"
+    stand = Pos(12, 23)
+    backs = (Pos(9, 24), Pos(9, 23))
+    start = Pos(8, 3)
+    step = move_pos(response, WORKER_2)
+    assert step is not None and step != stand
+    assert min(distance(step, cell) for cell in backs) < min(
+        distance(start, cell) for cell in backs
+    )
+    assert move_pos(response, PIONEER) != stand
 
 
 def test_night_pioneer_with_phase_task_does_not_take_the_gun(make_payload):
