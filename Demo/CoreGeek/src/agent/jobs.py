@@ -40,6 +40,10 @@ class Job:
     started: int = 0
     fail_streak: int = 0
     tower_id: int = 0
+    # 跨回合接着做同一件小任务，不要走两步就另选目标。
+    big: str = ""
+    small: str = ""
+    progress: int = 0
 
 
 def assign_roles(turn, memory) -> None:
