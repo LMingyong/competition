@@ -4,7 +4,10 @@ from agent.brain import decide
 from agent.protocol import Pos, distance
 
 from tests.helpers import (
+    GATLING,
     PIONEER,
+    RAILGUN,
+    ROCKET,
     WORKER_1,
     WORKER_2,
     action_of,
@@ -320,4 +323,40 @@ def test_weapon_voucher_beats_adjacent_wall(make_payload):
                 for tower in towers
             )
         assert _span(step) < _span(stand)
+
+
+def test_later_days_do_not_rebuild_rockets_and_keep_walling(make_payload):
+    """第二天、第三天炮已在口袋:不再建造火箭;包里有石头就继续砌朝向敌人的墙。"""
+    import agent.tasks as tasks_mod
+
+    for round_no in (140, 270):
+        tasks_mod.MEMORY = tasks_mod.Memory()
+        payload = fresh(make_payload(roundNo=round_no))
+        payload["teamOur"]["goldNum"] = 75
+        drop_walls(payload)
+        cells = ((12, 24), (12, 22), (13, 22))
+        for unit_id, (x, y) in zip((GATLING, RAILGUN, ROCKET), cells):
+            place(
+                payload, unit_id, x, y,
+                roleType="rocket", cooldown=0, level=1,
+                attackRange=10, attackPower=20, health=1000,
+            )
+        place(
+            payload, WORKER_1, 12, 21,
+            backpack=["stone", "stone", "stone", "stone"],
+        )
+        place(payload, WORKER_2, 16, 18, backpack=[])
+        place(payload, PIONEER, 8, 24, backpack=["Medicine"])
+        response = decide(payload)
+        _validate(response, payload)
+        command = response[str(WORKER_1)]
+        assert command["action"] == "build", (round_no, command)
+        assert command.get("name") == "wall"
+        assert all(
+            not (
+                cmd["action"] == "build"
+                and cmd.get("name") in {"rocket", "gatling", "railgun"}
+            )
+            for cmd in response.values()
+        )
 
