@@ -28,3 +28,9 @@ Log/
 # OS
 .DS_Store
 Thumbs.db
+
+# 自动挑战脚本产物（浏览器配置、抓包日志、失败截图、本地打包）
+Demo/CoreGeek.tar.gz
+.browser-profile/
+scripts/captured_api.jsonl
+scripts/last_error.png
