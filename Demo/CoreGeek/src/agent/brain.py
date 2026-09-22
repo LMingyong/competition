@@ -150,14 +150,6 @@ def _worker_day(
         return gold_left, builds_left
     if _try_upgrade_or_fix(turn, role, commands):
         return gold_left, builds_left
-    upgrade = _next_upgrade(turn, role)
-    if upgrade is not None:
-        _, target = upgrade
-        if not _adjacent_building(turn, role, target):
-            step = _step_toward(turn, role, target.pos, claimed)
-            if step is not None:
-                commands[role.unit_id] = move_command(step)
-                return gold_left, builds_left
     if _should_home(turn, role, memory):
         if walls_missing and count_item(role, WALL_MATERIAL):
             for site in list(walls_missing):
@@ -176,6 +168,24 @@ def _worker_day(
         )
         _recall_to_tower(turn, role, claimed, commands, memory)
         return gold_left, builds_left
+
+    # 已派的单子没做完就继续:走到同一格,到了才 collect/build。
+    # 金币变了、旁边出现更贵的矿,都不换目标,避免每回合重新寻路。
+    continued = _continue_locked_job(
+        turn, role, sites, towers_missing, walls_missing, claimed,
+        commands, gold_left, builds_left, memory,
+    )
+    if continued is not None:
+        return continued
+
+    upgrade = _next_upgrade(turn, role)
+    if upgrade is not None:
+        _, target = upgrade
+        if not _adjacent_building(turn, role, target):
+            step = _step_toward(turn, role, target.pos, claimed)
+            if step is not None:
+                commands[role.unit_id] = move_command(step)
+                return gold_left, builds_left
 
     # 两名工人都去建三座火箭。炮位是基地朝敌一角的口袋:
     # 先建前两座,前两座落地再补最外侧那座。
@@ -490,6 +500,69 @@ def _recall_target(turn: World) -> Pos | None:
         return weapons[0].pos
     station = turn.station()
     return station.pos if station is not None else None
+
+
+def _continue_locked_job(
+    turn: World,
+    role: Unit,
+    sites: tuple[Pos, ...],
+    towers_missing: list[Pos],
+    walls_missing: list[Pos],
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    gold_left: int,
+    builds_left: int,
+    memory,
+) -> tuple[int, int] | None:
+    """工单还在就只执行它。没有发出指令也不另派一条路。
+
+    锁定成功时返回执行后的金币与建造额度,供同一回合下一名工人记账。
+    """
+    job = get_job(memory, role.unit_id)
+    if not _job_locked(
+        turn, role, job, memory, walls_missing, towers_missing, gold_left,
+    ):
+        return None
+    return _run_worker_job(
+        turn, role, job, sites, towers_missing, walls_missing,
+        claimed, commands, gold_left, builds_left, memory,
+    )
+
+
+def _job_locked(
+    turn: World,
+    role: Unit,
+    job: Job | None,
+    memory,
+    walls_missing: list[Pos],
+    towers_missing: list[Pos],
+    gold_left: int,
+) -> bool:
+    """目标还在、这单还没做完,则锁住。商店变便宜或矿价变化不算做完。"""
+    if job is None:
+        return False
+    if job.kind == KIND_MINE:
+        if role.backpack_full or num_ores(role) >= SELL_THRESHOLD:
+            return False
+        mines = dict(turn.all_mines())
+        if job.target is None or job.target not in mines:
+            return False
+        if job.name and mines[job.target] != job.name:
+            return False
+        return True
+    if job.kind == KIND_TOWER:
+        return (
+            job.target is not None
+            and job.target in towers_missing
+            and gold_left >= WEAPON_BUILD_COST
+        )
+    if job.kind == KIND_WALL:
+        return bool(walls_missing) and _wall_phase(turn)
+    if job.kind in {KIND_SHOP, KIND_SELL, KIND_RECALL}:
+        return _worker_job_valid(
+            turn, role, job, memory, walls_missing, towers_missing, gold_left,
+        )
+    return False
 
 
 def _worker_job_valid(
@@ -817,6 +890,10 @@ def _pioneer_day(
         )
         _recall_to_tower(turn, role, claimed, commands, memory)
         return "", _maybe_prompt(turn, memory)
+    job = get_job(memory, role.unit_id)
+    if job is not None and job.target is not None and distance(role.pos, job.target) > 1:
+        if job.kind in {KIND_ACCEPT, KIND_TREASURE, KIND_SHOP, KIND_SELL}:
+            return _run_pioneer_job(turn, role, job, memory, claimed, commands)
     if _try_accept_task(turn, role, claimed, commands, memory):
         return "", _maybe_prompt(turn, memory)
     if _try_treasure(turn, role, memory, claimed, commands):
