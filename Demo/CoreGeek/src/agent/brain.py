@@ -721,12 +721,12 @@ def _claim_worker_job(
         return
     if job is not None:
         clear_job(memory, role.unit_id)
+    if memory.ticket_owner.get(role.unit_id) is None:
+        claim_next_ticket(turn, memory, role.unit_id)
     if _claim_tower_job(
         turn, role, sites, towers_missing, claimed, commands, memory,
     ):
         return
-    if memory.ticket_owner.get(role.unit_id) is None:
-        claim_next_ticket(turn, memory, role.unit_id)
     ticket = memory.ticket_owner.get(role.unit_id)
     if ticket == BUILD_TOWER:
         _claim_tower_job(
@@ -734,7 +734,6 @@ def _claim_worker_job(
         )
         return
     if ticket == BUILD_WALL:
-        _claim_wall_job(turn, role, walls_missing, claimed, memory)
         return
     if ticket in {UPGRADE_TOWER, UPGRADE_WALL}:
         return
@@ -870,19 +869,25 @@ def _execute_worker_job(
         result = _run_wall_ticket(
             turn, role, walls_missing, claimed, commands, gold_left, builds_left, memory,
         )
-        return gold_left, builds_left if result is None else result
+        if result is None:
+            return gold_left, builds_left
+        return result
     if ticket in {UPGRADE_TOWER, UPGRADE_WALL}:
         result = _run_upgrade_ticket(
             turn, role, ticket, walls_missing, towers_missing, claimed,
             commands, gold_left, builds_left, memory,
         )
-        return gold_left, builds_left if result is None else result
+        if result is None:
+            return gold_left, builds_left
+        return result
     if ticket == BUILD_TOWER:
         result = _run_tower_ticket(
             turn, role, sites, towers_missing, walls_missing, claimed,
             commands, gold_left, builds_left, memory,
         )
-        return gold_left, builds_left if result is None else result
+        if result is None:
+            return gold_left, builds_left
+        return result
     if job is not None:
         return _run_worker_job(
             turn, role, job, sites, towers_missing, walls_missing,
@@ -930,21 +935,23 @@ def _fallback_worker_action(
                     turn, role, missing[0], step, index, claimed, commands, memory,
                 )
                 return gold_left, builds_left
-            _note_direction_blocked(turn, role, missing[0], claimed)
+        _note_direction_blocked(turn, role, missing[0], claimed)
         return gold_left, builds_left
+    rec = _block_record(role.unit_id)
     if job is not None and job.target is not None:
         if role.pos == job.target and _step_off_current(turn, role, claimed, commands):
             _stamp_job(memory, role, job)
             return gold_left, builds_left
-        step = _sidestep(
-            turn, role, job.target, claimed, _move_avoid(turn, job.target),
-        )
-        if step is not None:
-            claimed.add(step)
-            commands[role.unit_id] = move_command(step)
-            _stamp_job(memory, role, job)
-            return gold_left, builds_left
-        _note_direction_blocked(turn, role, job.target, claimed)
+        if rec.streak >= 2:
+            step = _sidestep(
+                turn, role, job.target, claimed, _move_avoid(turn, job.target),
+            )
+            if step is not None:
+                claimed.add(step)
+                commands[role.unit_id] = move_command(step)
+                _stamp_job(memory, role, job)
+                return gold_left, builds_left
+            _note_direction_blocked(turn, role, job.target, claimed)
     return _economy_after_tickets(
         turn, role, sites, towers_missing, walls_missing, claimed,
         commands, gold_left, builds_left, memory,
@@ -3605,16 +3612,11 @@ def _execute_mine(
         return True
     if _walk_adjacent(turn, role, pos, claimed, commands):
         return True
-    step = _sidestep(turn, role, pos, claimed, _move_avoid(turn, pos))
-    if step is None:
-        _note_direction_blocked(turn, role, pos, claimed)
-        turn.note(
-            f"角色 {role.unit_id} 无法走向矿 ({pos.x},{pos.y})，保留工单"
-        )
-        return False
-    claimed.add(step)
-    commands[role.unit_id] = move_command(step)
-    return True
+    _note_direction_blocked(turn, role, pos, claimed)
+    turn.note(
+        f"角色 {role.unit_id} 无法走向矿 ({pos.x},{pos.y})，保留工单"
+    )
+    return False
 
 
 def _execute_shop(
@@ -3789,11 +3791,8 @@ def _walk_adjacent(
         return False
     step = _step_toward(turn, role, target, claimed)
     if step is None or step == role.pos:
-        step = _sidestep(turn, role, target, claimed, _move_avoid(turn, target))
-        if step is None:
-            _note_direction_blocked(turn, role, target, claimed)
-            return False
-        claimed.add(step)
+        _note_direction_blocked(turn, role, target, claimed)
+        return False
     commands[role.unit_id] = move_command(step)
     return True
 
@@ -3909,11 +3908,6 @@ def _step_toward(
         step = next_step(turn, role, stand, avoid)
         if step is None or step in claimed or step in avoid_set:
             continue
-        rec.pending_goal = target
-        claimed.add(step)
-        return step
-    step = _sidestep(turn, role, target, claimed, avoid_set)
-    if step is not None and step != role.pos:
         rec.pending_goal = target
         claimed.add(step)
         return step
