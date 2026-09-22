@@ -60,6 +60,9 @@ class Memory:
     accepted_round: int = 0
     jobs: dict[int, Job] = field(default_factory=dict)
     roles: dict[int, str] = field(default_factory=dict)
+    ticket_owner: dict[int, str] = field(default_factory=dict)
+    ticket_penalty: dict[str, int] = field(default_factory=dict)
+    ticket_hold: set[int] = field(default_factory=set)
 
 
 MEMORY = Memory()
@@ -75,6 +78,9 @@ def observe(turn: World) -> Memory:
         _reset_task_progress(memory)
         memory.jobs.clear()
         memory.roles.clear()
+        memory.ticket_owner.clear()
+        memory.ticket_penalty.clear()
+        memory.ticket_hold.clear()
     memory.last_round = turn.round_no
     update_fail_streaks(turn, memory)
     if turn.llm_limited():

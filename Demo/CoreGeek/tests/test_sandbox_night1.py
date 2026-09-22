@@ -75,10 +75,9 @@ def test_day_one_opening_does_not_attack():
 
 
 def test_day_one_opening_all_heroes_act_and_workers_go_for_towers():
-    """沙箱开局两名工人都去建塔/走近塔(09:00 移动),不得把第二人拆去采矿。"""
+    """沙箱开局:第一名工人去建炮,第二名领建墙去采石,不得空闲。"""
     payload = new_game()
     sites = _tower_sites(World.load(payload))
-    start2 = Pos(29, 7)
     response = decide(payload)
     _validate(response, payload)
     assert str(WORKER_1) in response
@@ -87,10 +86,8 @@ def test_day_one_opening_all_heroes_act_and_workers_go_for_towers():
     assert builder["action"] in {"build", "move"}
     if builder["action"] == "build":
         assert builder["name"] in {"gatling", "railgun", "rocket"}
+        raw = builder["targetPos"][0]
+        assert Pos(int(raw["x"]), int(raw["y"])) in sites
     other = response[str(WORKER_2)]
-    assert other["action"] in {"build", "move"}
-    if other["action"] == "move":
-        step = Pos(int(other["targetPos"][0]["x"]), int(other["targetPos"][0]["y"]))
-        assert min(distance(step, site) for site in sites) <= min(
-            distance(start2, site) for site in sites
-        )
+    assert other["action"] in {"move", "collect"}
+    assert other.get("name") != "rocket"

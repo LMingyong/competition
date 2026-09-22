@@ -273,26 +273,31 @@ def test_opening_workers_all_get_commands(make_payload):
 
 
 def test_opening_both_workers_walk_toward_towers(make_payload):
-    """09:00 移动:开局两名工人都走近/建造塔,第二人不得被拆去远处铜矿。"""
+    """开局 75 金:第一人去建炮,第二人领建墙并就近采石,不去远处铜矿。"""
     payload = _opening_no_buildings(fresh(make_payload(roundNo=1)))
-    starts = {WORKER_1: Pos(5, 23), WORKER_2: Pos(10, 16)}
+    start1 = Pos(5, 23)
+    start2 = Pos(10, 16)
     sites = _tower_sites(World.load(payload))
     response = decide(payload)
     _validate(response, payload)
-    for uid, start in starts.items():
-        action = action_of(response, uid)
-        assert action in {"move", "build"}, f"{uid} 开局应去建塔,得到 {action}"
-        if action == "move":
-            step = move_pos(response, uid)
-            assert step is not None
-            assert min(distance(step, site) for site in sites) < min(
-                distance(start, site) for site in sites
-            ), f"{uid} 应从 {start} 走近塔,实际走到 {step}"
-        else:
-            raw = response[str(uid)]["targetPos"][0]
-            built = Pos(int(raw["x"]), int(raw["y"]))
-            assert built in sites
-            assert response[str(uid)]["name"] in {"gatling", "railgun", "rocket"}
+    assert action_of(response, WORKER_1) in {"move", "build"}
+    if action_of(response, WORKER_1) == "move":
+        step = move_pos(response, WORKER_1)
+        assert step is not None
+        assert min(distance(step, site) for site in sites) < min(
+            distance(start1, site) for site in sites
+        )
+    else:
+        raw = response[str(WORKER_1)]["targetPos"][0]
+        assert Pos(int(raw["x"]), int(raw["y"])) in sites
+    assert action_of(response, WORKER_2) in {"move", "collect"}
+    assert action_of(response, WORKER_2) != "build"
+    if action_of(response, WORKER_2) == "move":
+        step2 = move_pos(response, WORKER_2)
+        assert step2 is not None
+        assert distance(step2, Pos(22, 26)) >= distance(start2, Pos(22, 26))
+    assert tasks_mod.MEMORY.ticket_owner[WORKER_1] == "建炮"
+    assert tasks_mod.MEMORY.ticket_owner[WORKER_2] == "建墙"
 
 
 def test_locked_tower_spend_updates_gold_for_next_worker(make_payload):

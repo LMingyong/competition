@@ -44,14 +44,19 @@ def _opening_towers_no_walls(payload, gold: int) -> None:
 
 
 def test_early_day_mines_copper_while_walls_missing(make_payload):
-    """回合 20、三塔已齐、墙未建、金币不够升塔:贴铜矿应 collect 铜,不去采石砌墙。"""
+    """回合 20、三塔已齐:建墙的人去采石且不砌墙;另一人金币不够时就近采铜。"""
     payload = fresh(make_payload(roundNo=20))
     _opening_towers_no_walls(payload, gold=0)
-    start = Pos(8, 2)
-    place(payload, WORKER_1, start.x, start.y, backpack=[])
+    place(payload, WORKER_1, 16, 18, backpack=[])
+    place(payload, WORKER_2, 8, 2, backpack=[])
     response = decide(payload)
     _validate(response, payload)
-    command = response.get(str(WORKER_1))
+    wall_cmd = response.get(str(WORKER_1))
+    assert wall_cmd is not None
+    assert not (
+        wall_cmd["action"] == "build" and wall_cmd.get("name") == "wall"
+    ), wall_cmd
+    command = response.get(str(WORKER_2))
     assert command is not None
     assert command["action"] == "collect"
     target = command["targetPos"][0]
@@ -73,13 +78,15 @@ def test_early_day_does_not_build_wall(make_payload):
 
 
 def test_early_day_buys_weapon_voucher_when_gold_enough(make_payload):
-    """回合 20、墙未齐但金币够:已在武器商店旁应买 WeaponUpgradeVoucher1。"""
+    """回合 20:建墙的人不因金币够买券改去商店;另一人在商店旁买武器升级券。"""
     payload = fresh(make_payload(roundNo=20))
     _opening_towers_no_walls(payload, gold=120)
-    place(payload, WORKER_1, 24, 20, backpack=[])
+    place(payload, WORKER_1, 16, 12, backpack=[])
+    place(payload, WORKER_2, 24, 20, backpack=[])
     response = decide(payload)
     _validate(response, payload)
-    command = response[str(WORKER_1)]
+    assert action_of(response, WORKER_1) != "buy"
+    command = response[str(WORKER_2)]
     assert command["action"] == "buy"
     assert command.get("name") == "WeaponUpgradeVoucher1"
 
@@ -96,12 +103,19 @@ def test_uses_weapon_voucher_on_tower_before_walls(make_payload):
     assert command.get("name") == "WeaponUpgradeVoucher1"
 
 
+def _stones_for_plan(payload) -> list[str]:
+    from agent.brain import _wall_order
+    from agent.world import World
+
+    return ["stone"] * len(_wall_order(World.load(payload)))
+
+
 def test_after_round_30_builds_wall_when_cannot_upgrade(make_payload):
-    """第 35 回合、金币不够升塔、工人墙边有石头:开始建墙。"""
+    """第 35 回合、计划里的石头已经采够:开始建墙。"""
     payload = fresh(make_payload(roundNo=35))
     drop_walls(payload)
     payload["teamOur"]["goldNum"] = 0
-    place(payload, WORKER_1, 12, 21, backpack=["stone", "stone", "stone", "stone"])
+    place(payload, WORKER_1, 12, 21, backpack=_stones_for_plan(payload))
     place(payload, PIONEER, 8, 24, backpack=["Medicine"])
     response = decide(payload)
     _validate(response, payload)
@@ -111,13 +125,16 @@ def test_after_round_30_builds_wall_when_cannot_upgrade(make_payload):
 
 
 def test_after_round_30_upgrade_still_beats_wall(make_payload):
-    """第 35 回合即使该砌墙,金币够升塔时仍先买武器升级券。"""
+    """第 35 回合:砌墙的人石头没够就去采石;另一人金币够时在商店买武器券。"""
     payload = fresh(make_payload(roundNo=35))
     _opening_towers_no_walls(payload, gold=120)
-    place(payload, WORKER_1, 24, 20, backpack=[])
+    place(payload, WORKER_1, 20, 15, backpack=[])
+    place(payload, WORKER_2, 24, 20, backpack=[])
     response = decide(payload)
     _validate(response, payload)
-    command = response[str(WORKER_1)]
+    assert action_of(response, WORKER_1) != "buy"
+    assert action_of(response, WORKER_1) != "build"
+    command = response[str(WORKER_2)]
     assert command["action"] == "buy"
     assert command.get("name") == "WeaponUpgradeVoucher1"
 
@@ -343,7 +360,7 @@ def test_later_days_do_not_rebuild_rockets_and_keep_walling(make_payload):
             )
         place(
             payload, WORKER_1, 12, 21,
-            backpack=["stone", "stone", "stone", "stone"],
+            backpack=_stones_for_plan(payload),
         )
         place(payload, WORKER_2, 16, 18, backpack=[])
         place(payload, PIONEER, 8, 24, backpack=["Medicine"])

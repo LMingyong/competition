@@ -10,8 +10,12 @@ _STEPS = (
 )
 
 
-def next_step(turn: Turn, moving: Unit, goal: Pos) -> Pos | None:
-    blocked = turn.blocked(moving)
+def next_step(
+    turn: Turn, moving: Unit, goal: Pos, avoid: set[Pos] | None = None,
+) -> Pos | None:
+    blocked = set(turn.blocked(moving))
+    if avoid:
+        blocked.update(avoid)
     order = count()
     frontier: list[tuple[int, int, int, Pos]] = [
         (distance(moving.pos, goal), 0, next(order), moving.pos)

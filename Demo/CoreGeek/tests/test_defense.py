@@ -170,9 +170,10 @@ def test_worker_builds_wall_when_towers_done(make_payload):
     ]
     for role in payload["teamOur"]["roles"]:
         if role.get("roleType") == "worker":
-            # 紧邻东侧墙位(13,21),带足石头应直接 build wall
+            # 紧邻东侧墙位(13,21),计划所需石头一次带齐应直接 build wall
             role["pos"] = {"x": 12, "y": 21}
-            role["backpack"] = ["stone", "stone", "stone", "stone", "stone"]
+            need = len(_wall_order(World.load(payload)))
+            role["backpack"] = ["stone"] * need
             break
     response = decide(payload)
     _validate_decision(response, payload)
@@ -224,9 +225,10 @@ def test_worker_builds_wall_over_selling(make_payload):
     ]
     for role in payload["teamOur"]["roles"]:
         if role.get("roleType") == "worker":
-            # 紧邻墙位、带足石头,同时携铁/铜(可卖)验证不被 sell 抢占
+            # 紧邻墙位、计划所需石头一次带齐,同时场景里仍可能有矿可卖
             role["pos"] = {"x": 12, "y": 21}
-            role["backpack"] = ["stone", "stone", "stone", "stone", "stone"]
+            need = len(_wall_order(World.load(payload)))
+            role["backpack"] = ["stone"] * need
             break
     response = decide(payload)
     _validate_decision(response, payload)

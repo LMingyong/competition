@@ -1,7 +1,10 @@
 """P2 贴塔开火:黑夜人已在塔旁且射程内有怪,必须 attack。"""
 
-from agent.brain import decide
+import agent.tasks as tasks_mod
+from agent.brain import decide, in_night_safe_zone
+from agent.jobs import KIND_MINE, Job
 from agent.protocol import Pos, distance
+from agent.world import World
 
 from tests.helpers import (
     GATLING,
@@ -175,7 +178,7 @@ def test_recall_gunner_walks_toward_pocket(make_payload):
 
 
 def test_night_only_one_fires_and_others_stay_off_stand(make_payload):
-    """夜里仍只有一人开火;另外两人走向基地朝敌一侧,不占背后站位。"""
+    """夜里仍只有一人开火；另外两人的目标在边缘安全区，不占站位、不进中央。"""
     payload = fresh(make_payload(roundNo=85, phaseTask=""))
     cells = ((9, 24), (9, 22), (8, 22))
     for unit_id, (x, y) in zip((GATLING, RAILGUN, ROCKET), cells):
@@ -194,21 +197,21 @@ def test_night_only_one_fires_and_others_stay_off_stand(make_payload):
     assert len(attacks) == 1
     assert attacks[0]["controllerId"] == str(WORKER_1)
     stand = Pos(9, 23)
-    backs = (Pos(12, 24), Pos(12, 23))
+    world = World.load(payload)
+    center = Pos(world.width // 2, world.height // 2)
     for uid, start in ((WORKER_2, Pos(4, 4)), (PIONEER, Pos(5, 5))):
+        job = tasks_mod.MEMORY.jobs.get(uid)
+        assert job is not None and job.target is not None
+        assert in_night_safe_zone(world, job.target)
+        assert distance(job.target, center) > 8
         step = move_pos(response, uid)
         assert step != stand
-        assert step is not None
-        assert min(distance(step, cell) for cell in backs) < min(
-            distance(start, cell) for cell in backs
-        )
+        if step is not None:
+            assert distance(step, job.target) < distance(start, job.target)
 
 
 def test_night_edge_miner_parks_behind_instead_of_mining(make_payload):
-    """夜里即使上一回合还在采边缘矿,也改停到基地朝敌一侧,不占站位和火箭格。"""
-    import agent.tasks as tasks_mod
-    from agent.jobs import KIND_MINE, Job
-
+    """夜里安全区外的矿被打断；非炮手改去安全区，不占站位，也不去中央。"""
     payload = fresh(make_payload(roundNo=85, phaseTask=""))
     cells = ((9, 24), (9, 22), (8, 22))
     for unit_id, (x, y) in zip((GATLING, RAILGUN, ROCKET), cells):
@@ -231,13 +234,17 @@ def test_night_edge_miner_parks_behind_instead_of_mining(make_payload):
     assert attacks[0]["controllerId"] == str(WORKER_1)
     assert action_of(response, WORKER_2) != "collect"
     stand = Pos(9, 23)
-    backs = (Pos(12, 24), Pos(12, 23))
+    world = World.load(payload)
+    center = Pos(world.width // 2, world.height // 2)
     start = Pos(8, 3)
+    job = tasks_mod.MEMORY.jobs.get(WORKER_2)
+    assert job is not None and job.target is not None
+    assert job.target != Pos(7, 2)
+    assert in_night_safe_zone(world, job.target)
+    assert distance(job.target, center) > 8
     step = move_pos(response, WORKER_2)
     assert step is not None and step != stand
-    assert min(distance(step, cell) for cell in backs) < min(
-        distance(start, cell) for cell in backs
-    )
+    assert distance(step, job.target) < distance(start, job.target)
     assert move_pos(response, PIONEER) != stand
 
 

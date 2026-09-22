@@ -5,6 +5,7 @@ from .debuglog import set_extra, write_round_log
 from .grid import next_step
 from .jobs import (
     KIND_ACCEPT,
+    KIND_HOLD,
     KIND_MAN_TOWER,
     KIND_MINE,
     KIND_PHASE,
@@ -19,7 +20,10 @@ from .jobs import (
     assign_roles,
     claimed_targets,
     clear_job,
+    drop_claimed_orders,
     get_job,
+    has_claimed_order,
+    interrupt_task,
     is_builder,
     set_job,
 )
@@ -57,6 +61,15 @@ from .tasks import (
     treasure_prompt,
     treasure_ready,
 )
+from .tickets import (
+    BUILD_TOWER,
+    BUILD_WALL,
+    UPGRADE_TOWER,
+    UPGRADE_WALL,
+    claim_next_ticket,
+    plan_big_task,
+    release_ticket,
+)
 from .world import HERO_MAX_HP, World, backpack_item, count_item
 
 TOWER_LOADOUT = ("rocket", "rocket", "rocket")
@@ -85,6 +98,10 @@ def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     turn = World.load(payload)
     memory = observe(turn)
     assign_roles(turn, memory)
+    # 入夜前 7 回合，以及入夜后的每一个黑夜回合：打断白天建炮/建墙/采矿/升级。
+    # interrupt_task 不看工单锁。炮手随后只回背后站位，其余人只进边缘安全区。
+    if _in_recall(turn) or not turn.is_day:
+        _interrupt_night_shift(turn, memory, "dusk" if turn.is_day else "night")
     commands: dict[int, dict[str, Any]] = {}
     prompt = ""
     execute_cmd = ""
@@ -105,6 +122,7 @@ def _day(
     memory,
     commands: dict[int, dict[str, Any]],
 ) -> tuple[str, str]:
+    memory.ticket_hold.clear()
     sites = _tower_sites(turn)
     order = _wall_order(turn)
     standing_towers = {unit.pos for unit in turn.weapons()}
@@ -161,7 +179,8 @@ def _worker_day(
 ) -> tuple[int, int]:
     if _try_heal(role, commands):
         return gold_left, builds_left
-    if _try_upgrade_or_fix(turn, role, commands):
+    # 入夜前这 7 回合不再升级，避免人贴着墙/炮升完才肯走。
+    if not _in_recall(turn) and _try_upgrade_or_fix(turn, role, commands):
         return gold_left, builds_left
     if _should_home(turn, role, memory):
         _recall_to_tower(turn, role, claimed, commands, memory)
@@ -181,6 +200,24 @@ def _worker_day(
             turn, role, walls_missing, claimed, commands, memory,
         ):
             return gold_left, builds_left
+
+    # 空闲工人领当前最高、还做得了、没被别人领走的大任务。领走后立刻降两位。
+    # 已经锁住的小工单先走完同一目标，不因这回合才领到单就换路。
+    if memory.ticket_owner.get(role.unit_id) is None:
+        continued = _continue_locked_job(
+            turn, role, sites, towers_missing, walls_missing, claimed,
+            commands, gold_left, builds_left, memory,
+        )
+        if continued is not None:
+            return continued
+        claim_next_ticket(turn, memory, role.unit_id)
+    if memory.ticket_owner.get(role.unit_id) is not None:
+        ticketed = _run_owned_ticket(
+            turn, role, sites, towers_missing, walls_missing, claimed,
+            commands, gold_left, builds_left, memory,
+        )
+        if ticketed is not None:
+            return ticketed
 
     # 已派的单子没做完就继续:走到同一格,到了才 collect/build。
     # 金币变了、旁边出现更贵的矿,都不换目标,避免每回合重新寻路。
@@ -204,7 +241,6 @@ def _worker_day(
     # 两名工人都去建三座火箭。炮位在基地背后、靠近地图边缘:
     # 先建前两座,前两座落地再补最外侧那座。
     # 三塔齐后先采矿换钱、能升塔就升塔; 第 30 回合起沿圈连续砌墙。
-    # 建完后升级顺序:武器 > 朝向敌人的围墙 > 其余围墙 > 基地。
     num_standing_towers = len(turn.weapons())
     if towers_missing and gold_left >= WEAPON_BUILD_COST and builds_left > 0:
         for index, site in enumerate(sites):
@@ -244,29 +280,19 @@ def _worker_day(
         if _build_walls(turn, role, walls_missing, claimed, commands, memory):
             return gold_left, builds_left
 
-    job = get_job(memory, role.unit_id)
-    if (
-        job is not None
-        and job.kind in {KIND_MINE, KIND_SHOP, KIND_SELL}
-        and _worker_job_valid(
-            turn, role, job, memory, walls_missing, towers_missing, gold_left,
-        )
-    ):
-        gold_left, builds_left = _run_worker_job(
-            turn, role, job, sites, towers_missing, walls_missing,
-            claimed, commands, gold_left, builds_left, memory,
-        )
-        if role.unit_id in commands:
-            return gold_left, builds_left
-        clear_job(memory, role.unit_id)
-    return _pick_worker_job(
-        turn, role, sites, towers_missing, walls_missing,
-        claimed, commands, gold_left, builds_left, memory,
+    return _economy_after_tickets(
+        turn, role, sites, towers_missing, walls_missing, claimed,
+        commands, gold_left, builds_left, memory,
     )
 
 
 def _in_recall(turn: World) -> bool:
     return bool(turn.is_day) and turn.round_in_day >= RECALL_FROM
+
+
+def _night_shift(turn: World) -> bool:
+    """入夜前 7 个白天回合，以及整个黑夜。"""
+    return (not turn.is_day) or _in_recall(turn)
 
 
 def _wall_phase(turn: World) -> bool:
@@ -407,10 +433,81 @@ def _should_home(turn: World, role: Unit, memory) -> bool:
 
 
 def _should_edge_mine(turn: World, role: Unit, memory) -> bool:
-    """回防窗口里不操炮的两人去边缘采矿。夜里改停在基地朝敌一侧,不再下矿。"""
+    """回防窗口里不操炮的人改去己方边缘安全区，不再往敌人一侧砌墙。"""
     if not _in_recall(turn):
         return False
     return not _is_gunner(turn, role, memory)
+
+
+def _pioneer_on_evolution(turn: World, role: Unit, memory) -> bool:
+    """停在己方任务点做自进化，或刚 accept 还没离开。拉开就会结束任务。"""
+    if role.kind != "pioneer":
+        return False
+    if turn.phase_task:
+        return True
+    return _just_accepted(turn, role, memory)
+
+
+def _interrupt_night_shift(turn: World, memory, reason: str) -> None:
+    """入夜前 7 回合和黑夜：清掉白天那张单，并钉住这一名炮手。
+
+    调用 interrupt_task(memory, role, reason)。工单锁不参与。
+    开拓者正做自进化时不打断。炮手若已是操炮单，只摘大任务，人不换。
+    安全区内的采矿/停留单保留，区外的建炮、建墙、采矿、购物一律清掉。
+    """
+    contenders = [
+        role for role in turn.controllable()
+        if not _pioneer_on_evolution(turn, role, memory)
+    ]
+    gunner = _select_gunner(turn, contenders, memory)
+    if gunner is not None:
+        job = get_job(memory, gunner.unit_id)
+        if job is not None and job.kind == KIND_MAN_TOWER:
+            drop_claimed_orders(memory, gunner.unit_id)
+        else:
+            interrupt_task(memory, gunner, reason)
+            _bind_gunner(turn, memory, gunner)
+    for role in turn.controllable():
+        if gunner is not None and role.unit_id == gunner.unit_id:
+            continue
+        if _pioneer_on_evolution(turn, role, memory):
+            continue
+        if _sheet_should_break(turn, role, memory):
+            interrupt_task(memory, role, reason)
+
+
+def _sheet_should_break(turn: World, role: Unit, memory) -> bool:
+    """白天的建炮/建墙/升级/区外采矿还挂在身上，就必须打断。"""
+    if has_claimed_order(memory, role.unit_id):
+        return True
+    job = get_job(memory, role.unit_id)
+    if job is None:
+        return False
+    if job.kind in {KIND_PHASE, KIND_ACCEPT, KIND_TREASURE}:
+        return False
+    if job.kind in {KIND_MINE, KIND_HOLD}:
+        return job.target is None or not in_night_safe_zone(turn, job.target)
+    if job.kind in {
+        KIND_WALL, KIND_TOWER, KIND_SHOP, KIND_SELL, KIND_RECALL, KIND_MAN_TOWER,
+    }:
+        return True
+    return False
+
+
+def _bind_gunner(turn: World, memory, gunner: Unit) -> None:
+    """打断之后立刻把这一名炮手钉回操炮，这 7 回合不再换人。"""
+    if _pattern_ready(turn):
+        _keep_gunner(memory, gunner, turn, _gun_stand(turn), 0)
+        return
+    weapons = turn.weapons()
+    if weapons:
+        tower = min(
+            weapons,
+            key=lambda unit: (distance(gunner.pos, unit.pos), unit.unit_id),
+        )
+        _keep_gunner(memory, gunner, turn, tower.pos, tower.unit_id)
+        return
+    _keep_gunner(memory, gunner, turn, _recall_target(turn), 0)
 
 
 def _pin_recall_gunner(turn: World, memory) -> None:
@@ -479,7 +576,7 @@ def _hold_near_edge(
     commands: dict[int, dict[str, Any]],
     memory,
 ) -> bool:
-    """卖不了就停在边缘矿旁,不往地图中央走,也不去炮位。"""
+    """背包满了就停在安全区矿旁，不往地图中央走，也不去炮位。"""
     taken = claimed_targets(memory, role.unit_id)
     job = get_job(memory, role.unit_id)
     mines = dict(turn.all_mines())
@@ -488,7 +585,7 @@ def _hold_near_edge(
         and job.kind == KIND_MINE
         and job.target is not None
         and job.target in mines
-        and _is_edge_mine(turn, job.target)
+        and in_night_safe_zone(turn, job.target)
     ):
         target = job.target
     else:
@@ -512,11 +609,26 @@ def _run_day_edge(
     commands: dict[int, dict[str, Any]],
     memory,
 ) -> bool:
+    return _assign_night_safe(turn, role, claimed, commands, memory)
+
+
+def _assign_night_safe(
+    turn: World,
+    role: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    memory,
+) -> bool:
+    """非炮手的采矿和停留只落在己方边缘安全区。没有矿就停在基地背后的空地。"""
     if role.backpack_full:
         if _sell_in_safe_zone(turn, role, claimed, commands, memory):
             return True
-        return _hold_near_edge(turn, role, claimed, commands, memory)
-    return _run_edge_mine(turn, role, claimed, commands, memory)
+        if _hold_near_edge(turn, role, claimed, commands, memory):
+            return True
+        return _park_in_safe_zone(turn, role, claimed, commands, memory)
+    if _run_edge_mine(turn, role, claimed, commands, memory):
+        return True
+    return _park_in_safe_zone(turn, role, claimed, commands, memory)
 
 
 def _edge_distance(turn: World, pos: Pos) -> int:
@@ -525,6 +637,50 @@ def _edge_distance(turn: World, pos: Pos) -> int:
 
 def _is_edge_mine(turn: World, pos: Pos) -> bool:
     return _edge_distance(turn, pos) <= EDGE_MINE_MAX
+
+
+def safe_zone_bounds(turn: World) -> tuple[int, int, int, int] | None:
+    """己方夜间安全区，含端点，返回 xmin, xmax, ymin, ymax。
+
+    只用基地背后、靠近地图外缘的一侧，不用敌人那一侧的边缘。
+    横向用 EDGE_MINE_MAX：离左/右地图边界不超过这圈，并且不越过基地外缘朝向中央。
+    纵向覆盖整张地图；真正落点再挑靠近基地背后的矿或空地。
+
+    挑战者样例基地 (10,24)，占地左缘 x=10：x 为 0..4，y 为 0..31。
+    守方样例基地 (30,10)，占地右缘 x=31：x 为 36..40，y 为 0..31。
+    炮手站位在这圈之外、仍在基地背后，允许炮手留在站位。
+    """
+    bounds = _station_bounds(turn)
+    if bounds is None:
+        return None
+    xmin, xmax, _ymin, _ymax = bounds
+    top = turn.height - 1
+    if _center_facing_east(turn):
+        outer = min(xmin, EDGE_MINE_MAX)
+        return 0, outer, 0, top
+    inner = max(xmax, turn.width - 1 - EDGE_MINE_MAX)
+    return inner, turn.width - 1, 0, top
+
+
+def in_night_safe_zone(turn: World, pos: Pos) -> bool:
+    """格子落在己方边缘安全区。朝向地图中心、或敌人一侧的边缘不算。"""
+    span = safe_zone_bounds(turn)
+    if span is None or pos is None:
+        return False
+    left, right, bottom, top = span
+    return left <= pos.x <= right and bottom <= pos.y <= top
+
+
+def _base_back_anchor(turn: World) -> Pos | None:
+    """基地朝向地图外缘的那一侧，安全区落点往这里靠。"""
+    bounds = _station_bounds(turn)
+    if bounds is None:
+        return None
+    xmin, xmax, ymin, ymax = bounds
+    mid_y = (ymin + ymax) // 2
+    if _center_facing_east(turn):
+        return Pos(xmin, mid_y)
+    return Pos(xmax, mid_y)
 
 
 def _pick_edge_mine(
@@ -538,7 +694,7 @@ def _pick_edge_mine(
     metals: list[tuple[Pos, str]] = []
     others: list[tuple[Pos, str]] = []
     for pos, kind in turn.all_mines():
-        if pos in blocked or not _is_edge_mine(turn, pos):
+        if pos in blocked or not in_night_safe_zone(turn, pos):
             continue
         if kind in ("copper", "iron"):
             metals.append((pos, kind))
@@ -547,13 +703,13 @@ def _pick_edge_mine(
     pool = metals or others
     if not pool:
         return None
-    center = _map_center(turn)
+    anchor = _base_back_anchor(turn) or _map_center(turn)
     return min(
         pool,
         key=lambda item: (
+            distance(item[0], anchor),
             _edge_distance(turn, item[0]),
             -turn.vendor_price(item[1]),
-            -distance(item[0], center),
             distance(role.pos, item[0]),
             item[0].x,
             item[0].y,
@@ -568,7 +724,7 @@ def _run_edge_mine(
     commands: dict[int, dict[str, Any]],
     memory,
 ) -> bool:
-    """回防窗口与黑夜:矿工只在地图边缘采矿,不穿过中央去小贩。"""
+    """回防窗口与黑夜：只挖己方边缘安全区里的矿，不穿过中央去小贩。"""
     if role.backpack_full:
         return False
     taken = claimed_targets(memory, role.unit_id)
@@ -579,7 +735,7 @@ def _run_edge_mine(
         and job.kind == KIND_MINE
         and job.target is not None
         and job.target in mines
-        and _is_edge_mine(turn, job.target)
+        and in_night_safe_zone(turn, job.target)
     ):
         target = job
     else:
@@ -1005,6 +1161,465 @@ def _pick_worker_job(
     return gold_left, builds_left
 
 
+def _economy_after_tickets(
+    turn: World,
+    role: Unit,
+    sites: tuple[Pos, ...],
+    towers_missing: list[Pos],
+    walls_missing: list[Pos],
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    gold_left: int,
+    builds_left: int,
+    memory,
+) -> tuple[int, int]:
+    """建造单都不可领时,才买券、卖矿、就近采矿。"""
+    shopped = _try_weapon_upgrade_shop(
+        turn, role, claimed, commands, gold_left, memory,
+    )
+    if shopped is not None:
+        return shopped, builds_left
+    job = get_job(memory, role.unit_id)
+    if (
+        job is not None
+        and job.kind in {KIND_MINE, KIND_SHOP, KIND_SELL}
+        and _worker_job_valid(
+            turn, role, job, memory, walls_missing, towers_missing, gold_left,
+        )
+    ):
+        gold_left, builds_left = _run_worker_job(
+            turn, role, job, sites, towers_missing, walls_missing,
+            claimed, commands, gold_left, builds_left, memory,
+        )
+        if role.unit_id in commands:
+            return gold_left, builds_left
+        clear_job(memory, role.unit_id)
+    return _pick_worker_job(
+        turn, role, sites, towers_missing, walls_missing,
+        claimed, commands, gold_left, builds_left, memory,
+    )
+
+
+def _run_owned_ticket(
+    turn: World,
+    role: Unit,
+    sites: tuple[Pos, ...],
+    towers_missing: list[Pos],
+    walls_missing: list[Pos],
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    gold_left: int,
+    builds_left: int,
+    memory,
+) -> tuple[int, int] | None:
+    name = memory.ticket_owner.get(role.unit_id)
+    if name == BUILD_WALL:
+        return _run_wall_ticket(
+            turn, role, walls_missing, claimed, commands, gold_left, builds_left, memory,
+        )
+    if name == BUILD_TOWER:
+        return _run_tower_ticket(
+            turn, role, sites, towers_missing, walls_missing, claimed,
+            commands, gold_left, builds_left, memory,
+        )
+    if name in {UPGRADE_TOWER, UPGRADE_WALL}:
+        return _run_upgrade_ticket(
+            turn, role, name, walls_missing, towers_missing, claimed,
+            commands, gold_left, builds_left, memory,
+        )
+    return None
+
+
+def _run_tower_ticket(
+    turn: World,
+    role: Unit,
+    sites: tuple[Pos, ...],
+    towers_missing: list[Pos],
+    walls_missing: list[Pos],
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    gold_left: int,
+    builds_left: int,
+    memory,
+) -> tuple[int, int] | None:
+    plan = plan_big_task(turn, BUILD_TOWER)
+    if not plan.claimable:
+        release_ticket(memory, role.unit_id)
+        return None
+    if gold_left < plan.material_count:
+        _fund_shortfall(
+            turn, role, walls_missing, towers_missing, claimed,
+            commands, gold_left, memory,
+        )
+        return gold_left, builds_left
+    job = get_job(memory, role.unit_id)
+    if (
+        job is not None
+        and job.kind == KIND_TOWER
+        and job.target in towers_missing
+        and gold_left >= WEAPON_BUILD_COST
+    ):
+        return _execute_tower(
+            turn, role, job, towers_missing, claimed, commands,
+            gold_left, builds_left, memory,
+        )
+    return _raise_pocket_towers(
+        turn, role, sites, towers_missing, claimed, commands,
+        gold_left, builds_left, memory,
+    )
+
+
+def _raise_pocket_towers(
+    turn: World,
+    role: Unit,
+    sites: tuple[Pos, ...],
+    towers_missing: list[Pos],
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    gold_left: int,
+    builds_left: int,
+    memory,
+) -> tuple[int, int]:
+    """只建口袋里还缺的火箭。先两门,再补最外侧。金币已够就不再先去采矿。"""
+    num_standing_towers = len(turn.weapons())
+    if not towers_missing or gold_left < WEAPON_BUILD_COST or builds_left <= 0:
+        return gold_left, builds_left
+    for index, site in enumerate(sites):
+        if site not in towers_missing or site in claimed:
+            continue
+        if num_standing_towers < 2 and index >= 2:
+            continue
+        if (
+            _outer_build_failed(turn, role, towers_missing)
+            and site == _outer_site(turn)
+        ):
+            continue
+        if not _build_or_walk(
+            turn, role, site, TOWER_LOADOUT[index], claimed, commands,
+        ):
+            continue
+        if (
+            role.unit_id in commands
+            and commands[role.unit_id]["action"] == "build"
+        ):
+            gold_left -= WEAPON_BUILD_COST
+            builds_left -= 1
+            if site in towers_missing:
+                towers_missing.remove(site)
+            clear_job(memory, role.unit_id)
+        else:
+            _keep_job(
+                memory, role, KIND_TOWER, target=site,
+                name=TOWER_LOADOUT[index], round_no=turn.round_no,
+            )
+        return gold_left, builds_left
+    return gold_left, builds_left
+
+
+def _run_wall_ticket(
+    turn: World,
+    role: Unit,
+    walls_missing: list[Pos],
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    gold_left: int,
+    builds_left: int,
+    memory,
+) -> tuple[int, int] | None:
+    """石头一次采够再沿墙连续砌。第 30 回合前只采不砌。"""
+    plan = plan_big_task(turn, BUILD_WALL)
+    if not plan.claimable:
+        release_ticket(memory, role.unit_id)
+        return None
+    have = count_item(role, WALL_MATERIAL)
+    cap = role.capacity if role.capacity else 100
+    free = max(0, cap - len(role.backpack))
+    target = min(len(walls_missing), have + free)
+    job = get_job(memory, role.unit_id)
+    building = job is not None and job.kind == KIND_WALL and job.name == WALL
+    if not _wall_phase(turn):
+        if have < target and free > 0:
+            _mine_stone_for_wall(turn, role, claimed, commands, memory)
+        else:
+            memory.ticket_hold.add(role.unit_id)
+        return gold_left, builds_left
+    if building and have > 0:
+        _lay_walls(turn, role, walls_missing, claimed, commands, memory)
+        return gold_left, builds_left
+    if have < target and free > 0:
+        _mine_stone_for_wall(turn, role, claimed, commands, memory)
+        return gold_left, builds_left
+    if have > 0:
+        _lay_walls(turn, role, walls_missing, claimed, commands, memory)
+        return gold_left, builds_left
+    _mine_stone_for_wall(turn, role, claimed, commands, memory)
+    return gold_left, builds_left
+
+
+def _mine_stone_for_wall(
+    turn: World,
+    role: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    memory,
+) -> bool:
+    """建墙的人只挖石头,挖够之前不改去砌墙,也不改去商店。"""
+    job = get_job(memory, role.unit_id)
+    target = None
+    if job is not None and job.name == WALL_MATERIAL and _stone_mine_ok(
+        turn, role, job, memory,
+    ):
+        target = job.target
+    if target is None:
+        taken = claimed_targets(memory, role.unit_id)
+        target = _nearest_mine(turn, role, WALL_MATERIAL, claimed, taken)
+    if target is None:
+        return False
+    _keep_job(
+        memory, role, KIND_WALL, target=target, name=WALL_MATERIAL,
+        round_no=turn.round_no,
+    )
+    if (
+        role.pos != target
+        and distance(role.pos, target) <= 1
+        and not _must_leave_stand(turn, role)
+    ):
+        commands[role.unit_id] = collect_command(target)
+        claimed.add(target)
+        return True
+    if _must_leave_stand(turn, role):
+        return _step_off_stand(turn, role, claimed, commands)
+    return _walk_adjacent(turn, role, target, claimed, commands)
+
+
+def _stone_mine_ok(turn: World, role: Unit, job: Job, memory) -> bool:
+    if job.target is None or role.backpack_full:
+        return False
+    mines = dict(turn.all_mines())
+    if mines.get(job.target) != WALL_MATERIAL:
+        return False
+    if _closer_mine_nearby(turn, role, job.target, memory):
+        return False
+    return True
+
+
+def _lay_walls(
+    turn: World,
+    role: Unit,
+    walls_missing: list[Pos],
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    memory,
+) -> bool:
+    job = get_job(memory, role.unit_id)
+    preferred = None
+    if (
+        job is not None
+        and job.name == WALL
+        and job.target is not None
+        and job.target in walls_missing
+    ):
+        preferred = job.target
+    return _build_walls(
+        turn, role, walls_missing, claimed, commands, memory,
+        preferred=preferred, allow_mine=False,
+    )
+
+
+def _run_upgrade_ticket(
+    turn: World,
+    role: Unit,
+    name: str,
+    walls_missing: list[Pos],
+    towers_missing: list[Pos],
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    gold_left: int,
+    builds_left: int,
+    memory,
+) -> tuple[int, int] | None:
+    plan = plan_big_task(turn, name)
+    if not plan.claimable:
+        release_ticket(memory, role.unit_id)
+        return None
+    wall = name == UPGRADE_WALL
+    vouchers = (
+        ("WallUpgradeVoucher1", "WallUpgradeVoucher2")
+        if wall
+        else ("WeaponUpgradeVoucher1", "WeaponUpgradeVoucher2")
+    )
+    if _pursue_voucher_target(turn, role, claimed, commands, vouchers):
+        return gold_left, builds_left
+    job = get_job(memory, role.unit_id)
+    if job is not None and job.kind == KIND_MINE and _mine_lock_holds(
+        turn, role, job, memory, walls_missing,
+    ):
+        _execute_mine(turn, role, job, claimed, commands)
+        return gold_left, builds_left
+    if (
+        job is not None
+        and job.kind == KIND_SHOP
+        and _worker_job_valid(
+            turn, role, job, memory, walls_missing, towers_missing, gold_left,
+        )
+    ):
+        gold_left = _execute_shop(
+            turn, role, job, claimed, commands, gold_left, memory,
+        )
+        return gold_left, builds_left
+    if (
+        job is not None
+        and job.kind == KIND_SELL
+        and _worker_job_valid(
+            turn, role, job, memory, walls_missing, towers_missing, gold_left,
+        )
+    ):
+        _execute_sell(turn, role, claimed, commands, walls_missing)
+        return gold_left, builds_left
+    voucher_name, price = _next_voucher_price(turn, wall)
+    shop = turn.weapon_shop_pos()
+    at_shop = shop is not None and turn.adjacent_to_zone(role, shop)
+    afford_one = price > 0 and gold_left >= price
+    afford_all = plan.material_count > 0 and gold_left >= plan.material_count
+    # 人还没到商店、整张单的金币还没凑齐:继续就近挖,不要半路改去买券。
+    if not afford_one or (not afford_all and not at_shop):
+        _fund_shortfall(
+            turn, role, walls_missing, towers_missing, claimed,
+            commands, gold_left, memory,
+        )
+        return gold_left, builds_left
+    if wall and voucher_name:
+        gold_left, bought = _buy_named(
+            turn, role, claimed, commands, gold_left, memory, voucher_name,
+        )
+        if bought:
+            return gold_left, builds_left
+    else:
+        shopped = _try_weapon_upgrade_shop(
+            turn, role, claimed, commands, gold_left, memory,
+        )
+        if shopped is not None:
+            return shopped, builds_left
+    if _should_keep_digging(role):
+        _fund_shortfall(
+            turn, role, walls_missing, towers_missing, claimed,
+            commands, gold_left, memory,
+        )
+    return gold_left, builds_left
+
+
+def _next_voucher_price(turn: World, wall: bool) -> tuple[str | None, int]:
+    names = _wall_upgrade_wishlist(turn) if wall else _weapon_voucher_wishlist(turn)
+    if not names:
+        return None, 0
+    item = turn.shop_item(names[0])
+    if item is None:
+        return names[0], 0
+    return names[0], item.price
+
+
+def _buy_named(
+    turn: World,
+    role: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    gold_left: int,
+    memory,
+    item_name: str,
+) -> tuple[int, bool]:
+    shop = turn.weapon_shop_pos()
+    item = turn.shop_item(item_name)
+    if shop is None or item is None or role.backpack_full or item.price > gold_left:
+        return gold_left, False
+    if backpack_item(role, item_name):
+        return gold_left, False
+    if turn.adjacent_to_zone(role, shop):
+        commands[role.unit_id] = buy_command(item_name, 1)
+        gold_left -= item.price
+        _keep_job(
+            memory, role, KIND_SHOP, target=shop, name=item_name,
+            round_no=turn.round_no,
+        )
+        return gold_left, True
+    if _should_keep_digging(role):
+        return gold_left, False
+    if _walk_adjacent(turn, role, shop, claimed, commands):
+        _keep_job(
+            memory, role, KIND_SHOP, target=shop, name=item_name,
+            round_no=turn.round_no,
+        )
+        return gold_left, True
+    return gold_left, False
+
+
+def _pursue_voucher_target(
+    turn: World,
+    role: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    vouchers: tuple[str, ...],
+) -> bool:
+    for voucher in vouchers:
+        name = backpack_item(role, voucher)
+        if name is None:
+            continue
+        target = _best_upgrade_unit(turn, role, voucher)
+        if target is None:
+            continue
+        if _adjacent_building(turn, role, target):
+            commands[role.unit_id] = use_command(name, target.pos)
+            return True
+        step = _step_toward(turn, role, target.pos, claimed)
+        if step is not None:
+            commands[role.unit_id] = move_command(step)
+            return True
+    return False
+
+
+def _fund_shortfall(
+    turn: World,
+    role: Unit,
+    walls_missing: list[Pos],
+    towers_missing: list[Pos],
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    gold_left: int,
+    memory,
+) -> None:
+    """金不够时先采近处矿再卖,卖够差额再去建或买。采的路上不改去商店。"""
+    job = get_job(memory, role.unit_id)
+    if job is not None and job.kind == KIND_MINE and _mine_lock_holds(
+        turn, role, job, memory, walls_missing,
+    ):
+        _execute_mine(turn, role, job, claimed, commands)
+        return
+    if (
+        job is not None
+        and job.kind == KIND_SELL
+        and _worker_job_valid(
+            turn, role, job, memory, walls_missing, towers_missing, gold_left,
+        )
+    ):
+        _execute_sell(turn, role, claimed, commands, walls_missing)
+        return
+    if _try_sell(turn, role, claimed, commands, walls_missing):
+        _keep_job(
+            memory, role, KIND_SELL, target=turn.vendor(),
+            round_no=turn.round_no,
+        )
+        return
+    dest = _mine(
+        turn, role, claimed, commands,
+        extra=claimed_targets(memory, role.unit_id),
+    )
+    if dest is not None:
+        pos, kind = dest
+        _keep_job(
+            memory, role, KIND_MINE, target=pos, name=kind,
+            round_no=turn.round_no,
+        )
+
+
 def _execute_tower(
     turn: World,
     role: Unit,
@@ -1052,7 +1667,7 @@ def _recall_to_tower(
                 return False
             return _walk_onto(turn, role, stand, claimed, commands)
         if not turn.is_day:
-            return _park_behind(turn, role, claimed, commands)
+            return _assign_night_safe(turn, role, claimed, commands, memory)
         return False
     weapons = turn.weapons()
     if weapons:
@@ -1071,18 +1686,28 @@ def _recall_to_tower(
     return _walk_adjacent(turn, role, target, claimed, commands)
 
 
+def _battery_block(turn: World) -> set[Pos]:
+    """炮位和站位。非炮手赶去安全区时，路径不要踩上去。"""
+    blocked = set(_tower_sites(turn))
+    stand = _gun_stand(turn)
+    if stand is not None:
+        blocked.add(stand)
+    return blocked
+
+
 def _walk_onto(
     turn: World,
     role: Unit,
     target: Pos,
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
+    avoid: set[Pos] | None = None,
 ) -> bool:
     """走到目标格上。已经站在上面则不再移动。"""
     if role.pos == target:
         claimed.add(target)
         return True
-    step = next_step(turn, role, target)
+    step = next_step(turn, role, target, avoid)
     if step is None or step in claimed:
         turn.note(
             f"角色 {role.unit_id} 无法走上 ({target.x},{target.y})"
@@ -1123,19 +1748,21 @@ def _build_walls(
     commands: dict[int, dict[str, Any]],
     memory=None,
     preferred: Pos | None = None,
+    allow_mine: bool = True,
 ) -> bool:
-    """墙未建齐时,优先负责建墙:先采/走向石头矿,有石头则建墙。"""
+    """墙未建齐时沿计划砌。allow_mine 为假时石头不够就不改去挖矿。"""
     stones = count_item(role, WALL_MATERIAL)
-    mine = _adjacent_mine(turn, role, "stone")
-    if mine is not None and stones < STONE_KEEP:
-        commands[role.unit_id] = collect_command(mine)
-        claimed.add(mine)
-        if memory is not None:
-            _keep_job(
-                memory, role, KIND_WALL, target=mine,
-                name=WALL_MATERIAL, round_no=turn.round_no,
-            )
-        return True
+    if allow_mine:
+        mine = _adjacent_mine(turn, role, "stone")
+        if mine is not None and stones < STONE_KEEP:
+            commands[role.unit_id] = collect_command(mine)
+            claimed.add(mine)
+            if memory is not None:
+                _keep_job(
+                    memory, role, KIND_WALL, target=mine,
+                    name=WALL_MATERIAL, round_no=turn.round_no,
+                )
+            return True
     if stones:
         sites = list(walls_missing)
         if preferred is not None and preferred in walls_missing:
@@ -1161,6 +1788,8 @@ def _build_walls(
                         name=WALL, round_no=turn.round_no,
                     )
                 return True
+    if not allow_mine:
+        return False
     taken = claimed_targets(memory, role.unit_id) if memory is not None else set()
     stone = None
     if preferred is not None:
@@ -1506,7 +2135,7 @@ def _night(
     if pioneer is not None and pioneer.unit_id not in busy and (
         turn.phase_task or _just_accepted(turn, pioneer, memory)
     ):
-        # 任务还在就不要把开拓者选成炮手，也不要停去朝敌一侧。
+        # 任务还在就不要把开拓者选成炮手，也不要拉去安全区。
         if turn.phase_task:
             _keep_job(memory, pioneer, KIND_PHASE, round_no=turn.round_no)
             execute_cmd, prompt = _run_task(
@@ -1527,8 +2156,8 @@ def _night(
         if _try_night_item(turn, role, commands):
             busy.add(role.unit_id)
             continue
-        # 夜里只有炮手占背后站位。其余人停在基地朝敌一侧,不占新火箭和新站位。
-        _park_behind(turn, role, claimed, commands)
+        # 夜里只有炮手留在背后站位。其余人去边缘安全区，不进地图中央。
+        _assign_night_safe(turn, role, claimed, commands, memory)
     if not prompt:
         prompt = _maybe_prompt(turn, memory)
     return execute_cmd, prompt
@@ -1562,6 +2191,8 @@ def _fill_idle(turn: World, memory, commands: dict[int, dict[str, Any]]) -> None
     for role in turn.controllable():
         if role.unit_id in busy:
             continue
+        if role.unit_id in memory.ticket_hold:
+            continue
         if any(distance(role.pos, tower.pos) <= 1 for tower in turn.weapons()):
             if not _must_leave_stand(turn, role):
                 continue
@@ -1580,8 +2211,17 @@ def _fill_idle(turn: World, memory, commands: dict[int, dict[str, Any]]) -> None
             _recall_to_tower(turn, role, claimed, commands, memory)
             continue
         if not _is_gunner(turn, role, memory):
-            if not turn.is_day:
-                _park_behind(turn, role, claimed, commands)
+            if not turn.is_day or _in_recall(turn):
+                job = get_job(memory, role.unit_id)
+                if (
+                    job is not None
+                    and job.kind in {KIND_MINE, KIND_HOLD}
+                    and job.target is not None
+                    and in_night_safe_zone(turn, job.target)
+                    and distance(role.pos, job.target) <= 1
+                ):
+                    continue
+                _assign_night_safe(turn, role, claimed, commands, memory)
             continue
         _recall_to_tower(turn, role, claimed, commands, memory)
 
@@ -2070,10 +2710,13 @@ def _step_toward(
     *,
     inside_only: bool = False,
 ) -> Pos | None:
+    avoid = _battery_block(turn) if _night_shift(turn) and target != _gun_stand(turn) else None
     for stand in _stand_cells(turn, role, target, claimed, inside_only):
         if stand == role.pos:
             return None
-        step = next_step(turn, role, stand)
+        if avoid is not None and stand in avoid:
+            continue
+        step = next_step(turn, role, stand, avoid)
         if step is None or step in claimed:
             continue
         claimed.add(step)
@@ -2154,41 +2797,75 @@ def _gun_stand(turn: World) -> Pos | None:
     return stand
 
 
-def _back_cells(turn: World) -> tuple[Pos, ...]:
-    """炮已在基地背后。不操炮的人停在朝向敌人的一侧,避开新火箭和新站位。"""
-    station = turn.station()
-    if station is None:
-        return ()
-    sx, sy = station.pos.x, station.pos.y
-    if _center_facing_east(turn):
-        raw = (Pos(sx + 2, sy), Pos(sx + 2, sy - 1))
-    else:
-        raw = (Pos(sx - 1, sy), Pos(sx - 1, sy - 1))
-    footprint = set(station_footprint(station.pos))
-    rockets, stand = _battery_cells(turn)
-    blocked = set(rockets)
+def _pick_safe_hold(
+    turn: World,
+    role: Unit,
+    claimed: set[Pos],
+    extra: set[Pos],
+) -> Pos | None:
+    """安全区里靠近基地背后的空地。不进中央，不占炮手站位。"""
+    span = safe_zone_bounds(turn)
+    anchor = _base_back_anchor(turn)
+    if span is None or anchor is None:
+        return None
+    left, right, bottom, top = span
+    blocked = set(claimed)
+    blocked.update(extra)
+    blocked.update(_tower_sites(turn))
+    stand = _gun_stand(turn)
     if stand is not None:
         blocked.add(stand)
-    return tuple(
-        pos for pos in raw
-        if turn.land(pos) and pos not in footprint and pos not in blocked
+    station = turn.station()
+    footprint = set(station_footprint(station.pos)) if station is not None else set()
+    options: list[Pos] = []
+    for x in range(left, right + 1):
+        for y in range(bottom, top + 1):
+            pos = Pos(x, y)
+            if pos in blocked or pos in footprint:
+                continue
+            if not turn.land(pos):
+                continue
+            if pos != role.pos and pos in turn.blocked(role):
+                continue
+            options.append(pos)
+    if not options:
+        return None
+    return min(
+        options,
+        key=lambda pos: (distance(pos, anchor), distance(role.pos, pos), pos.x, pos.y),
     )
 
 
-def _park_behind(
+def _park_in_safe_zone(
     turn: World,
     role: Unit,
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
+    memory,
 ) -> bool:
-    cells = [pos for pos in _back_cells(turn) if pos == role.pos or pos not in claimed]
-    if not cells:
-        return False
-    if role.pos in cells:
-        claimed.add(role.pos)
+    """安全区没有可挖的矿时，停在靠近基地背后的空地。"""
+    taken = claimed_targets(memory, role.unit_id)
+    job = get_job(memory, role.unit_id)
+    if (
+        job is not None
+        and job.kind == KIND_HOLD
+        and job.target is not None
+        and in_night_safe_zone(turn, job.target)
+        and job.target not in taken
+        and (job.target == role.pos or job.target not in turn.blocked(role))
+    ):
+        target = job.target
+    else:
+        target = _pick_safe_hold(turn, role, claimed, taken)
+        if target is None:
+            return False
+        _keep_job(memory, role, KIND_HOLD, target=target, round_no=turn.round_no)
+    if role.pos == target:
+        claimed.add(target)
         return True
-    target = min(cells, key=lambda pos: (distance(role.pos, pos), pos.x, pos.y))
-    return _walk_onto(turn, role, target, claimed, commands)
+    return _walk_onto(
+        turn, role, target, claimed, commands, avoid=_battery_block(turn),
+    )
 
 
 def _station_bounds(turn: World) -> tuple[int, int, int, int] | None:

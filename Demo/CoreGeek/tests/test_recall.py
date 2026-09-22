@@ -3,8 +3,8 @@
 import pytest
 
 import agent.tasks as tasks_mod
-from agent.brain import RECALL_FROM, RECALL_ROUNDS, _is_edge_mine, decide
-from agent.jobs import KIND_MAN_TOWER, KIND_MINE, KIND_WALL, Job
+from agent.brain import RECALL_FROM, RECALL_ROUNDS, in_night_safe_zone, decide
+from agent.jobs import KIND_HOLD, KIND_MAN_TOWER, KIND_MINE, KIND_WALL, Job
 from agent.protocol import DAY_ROUNDS, Pos, distance
 from agent.world import World
 
@@ -146,12 +146,15 @@ def test_last_seven_rounds_one_gunner_others_edge_mine(make_payload, round_no):
     gunner_job = tasks_mod.MEMORY.jobs.get(WORKER_1)
     assert gunner_job is not None and gunner_job.kind == KIND_MAN_TOWER
 
+    center = Pos(world.width // 2, world.height // 2)
     for uid, start in ((WORKER_2, miner_start), (PIONEER, pioneer_start)):
         job = tasks_mod.MEMORY.jobs.get(uid)
         assert job is not None
-        assert job.kind == KIND_MINE
+        assert job.kind in {KIND_MINE, KIND_HOLD}
         assert job.kind != KIND_MAN_TOWER
-        assert job.target is not None and _is_edge_mine(world, job.target)
+        assert job.kind != KIND_WALL
+        assert job.target is not None and in_night_safe_zone(world, job.target)
+        assert distance(job.target, center) > 8
         assert job.target != stand
         step = move_pos(response, uid)
         assert step != stand
@@ -181,10 +184,10 @@ def test_full_backpack_does_not_cross_center_to_vendor(make_payload):
     _validate(response, payload)
     assert action_of(response, WORKER_2) != "sell"
     job = tasks_mod.MEMORY.jobs.get(WORKER_2)
-    assert job is not None and job.kind == KIND_MINE
+    assert job is not None and job.kind in {KIND_MINE, KIND_HOLD}
     assert job.target is not None
     world = World.load(payload)
-    assert _is_edge_mine(world, job.target)
+    assert in_night_safe_zone(world, job.target)
     assert job.target != Pos(20, 16)
     step = move_pos(response, WORKER_2)
     assert step != Pos(9, 23)

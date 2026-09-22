@@ -70,10 +70,14 @@ def test_missing_walls_walk_to_nearest_stone_mine(make_payload):
 
 
 def test_has_stone_builds_instead_of_more_ore(make_payload):
-    """砌墙阶段墙未齐且工人紧邻墙位、包里有石头:直接建墙。"""
+    """砌墙阶段墙未齐、计划所需石头已经在背包里:直接建墙,不再去挖矿。"""
+    from agent.brain import _wall_order
+    from agent.world import World
+
     payload = fresh(make_payload(roundNo=35))
     drop_walls(payload)
-    place(payload, WORKER_1, 12, 21, backpack=["stone", "stone", "stone", "stone"])
+    need = len(_wall_order(World.load(payload)))
+    place(payload, WORKER_1, 12, 21, backpack=["stone"] * need)
     place(payload, PIONEER, 8, 24, backpack=["Medicine"])
     response = decide(payload)
     _validate(response, payload)
