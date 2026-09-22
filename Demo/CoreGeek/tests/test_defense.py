@@ -4,7 +4,7 @@
 从不建墙,导致第 71 回合机器人涌来时基地无墙可守而失败。
 本文件针对两项修复做回归:
   1. brain._wall_order / brain._tower_sites 优先朝向地图中央建防御;
-     第一天只按左右朝向中心砌约 50% 围墙,远离中心的半圈留作出入口;
+     第一天只按左右朝向中心砌约 50% 围墙,并沿外圈连续建造;
   2. brain._worker_day 在第 30 回合砌墙阶段、墙未建齐且无法升塔时优先建墙。
 """
 
@@ -13,7 +13,7 @@ from __future__ import annotations
 from agent.brain import (
     _center_facing_east,
     _center_facing_sides,
-    _map_center,
+    _gun_stand,
     _on_incoming_side,
     _tower_sites,
     _wall_order,
@@ -56,8 +56,7 @@ def _set_station(payload, x, y):
 
 
 def _assert_day1_center_walls(world: World) -> tuple[Pos, ...]:
-    """第一天墙位必须是按左右朝向地图中心的约一半外圈,且由近到远。"""
-    center = _map_center(world)
+    """第一天墙位仍是朝向地图中心的半圈,但沿外圈连续砌,不再按距中心跳格。"""
     ring = _wall_ring(world)
     order = _wall_order(world)
     facing = _center_facing_sides(world)
@@ -73,13 +72,10 @@ def _assert_day1_center_walls(world: World) -> tuple[Pos, ...]:
     assert all(_on_incoming_side(pos, world) for pos in order), (
         f"第一天墙位必须在朝向中心的左/右半圈: facing={sorted(facing)} order={order}"
     )
-    ring_min = min(distance(pos, center) for pos in ring)
-    assert distance(order[0], center) == ring_min, (
-        f"最先建造的墙应是整圈最靠中心的格子: 首={order[0]} "
-        f"dist={distance(order[0], center)} 全局最小={ring_min}"
-    )
-    dists = [distance(pos, center) for pos in order]
-    assert dists == sorted(dists), "朝向中心的墙位应按距中心从近到远建造"
+    for left, right in zip(order, order[1:]):
+        assert distance(left, right) <= 2, (
+            f"建墙应沿圈连续,相邻计划格不能跳开: {left} -> {right}"
+        )
     back_cells = [pos for pos in ring if not _on_incoming_side(pos, world)]
     assert back_cells, "远离中心的半圈应留空作出入口"
     assert not (set(order) & set(back_cells)), "第一天不得把背向中心的墙排进计划"
@@ -121,18 +117,27 @@ def test_day1_wall_quota_is_about_half(make_payload):
     _assert_day1_center_walls(World.load(payload))
 
 
-def test_tower_sites_faces_map_center(make_payload):
-    """朝向修复:塔位首选应朝向地图中央。"""
+def test_tower_sites_form_one_pocket(make_payload):
+    """三门火箭围住中间一格空地,站上去能同时挨到三门。"""
     payload = make_payload(roundNo=1)
     payload = _strip_roles(payload)
     world = World.load(payload)
-    center = _map_center(world)
     sites = _tower_sites(world)
-    assert sites, "地图应有可建塔位"
-    # 首选塔位应是最靠中央的方向
-    best = min(distance(pos, center) for pos in sites)
-    assert distance(sites[0], center) == best, \
-        f"首选塔位应朝向中央:sites[0]={sites[0]} center={center}"
+    stand = _gun_stand(world)
+    assert sites == (Pos(12, 24), Pos(12, 22), Pos(13, 22))
+    assert stand == Pos(12, 23)
+    assert stand is not None
+    assert all(distance(stand, site) == 1 for site in sites)
+
+    payload["teamOur"]["type"] = "defender"
+    _set_station(payload, 30, 10)
+    defender = World.load(payload)
+    sites = _tower_sites(defender)
+    stand = _gun_stand(defender)
+    assert sites == (Pos(29, 9), Pos(29, 11), Pos(28, 11))
+    assert stand == Pos(29, 10)
+    assert stand is not None
+    assert all(distance(stand, site) == 1 for site in sites)
 
 
 def test_worker_builds_wall_when_towers_done(make_payload):

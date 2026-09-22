@@ -174,13 +174,13 @@ def _worker_day(
             memory, role, KIND_RECALL, target=_recall_target(turn),
             round_no=turn.round_no,
         )
-        _recall_to_tower(turn, role, claimed, commands)
+        _recall_to_tower(turn, role, claimed, commands, memory)
         return gold_left, builds_left
 
-    # 09:00 逻辑:两名工人都去建塔/走近塔,不按 builder/miner 拆开。
-    # 优先建前两个塔位，第三个只有在前面两个都满了之后才建。
-    # 三塔齐后先采矿换钱、能升塔就升塔; 第 30 回合起砌墙,第一天把墙建齐。
-    # 建完后升级顺序:武器 > 朝向敌人的围墙(从地图中心向外) > 其余围墙 > 基地。
+    # 两名工人都去建三座火箭。炮位是基地朝敌一角的口袋:
+    # 先建前两座,前两座落地再补最外侧那座。
+    # 三塔齐后先采矿换钱、能升塔就升塔; 第 30 回合起沿圈连续砌墙。
+    # 建完后升级顺序:武器 > 朝向敌人的围墙 > 其余围墙 > 基地。
     num_standing_towers = len(turn.weapons())
     if towers_missing and gold_left >= WEAPON_BUILD_COST and builds_left > 0:
         for index, site in enumerate(sites):
@@ -584,7 +584,7 @@ def _run_worker_job(
         _execute_mine(turn, role, job, claimed, commands)
         return gold_left, builds_left
     if job.kind == KIND_RECALL:
-        _recall_to_tower(turn, role, claimed, commands)
+        _recall_to_tower(turn, role, claimed, commands, memory)
         return gold_left, builds_left
     return gold_left, builds_left
 
@@ -659,7 +659,15 @@ def _recall_to_tower(
     role: Unit,
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
+    memory=None,
 ) -> bool:
+    if memory is not None and _pattern_ready(turn):
+        if _is_gunner(turn, role, memory):
+            stand = _gun_stand(turn)
+            if stand is None:
+                return False
+            return _walk_onto(turn, role, stand, claimed, commands)
+        return _park_behind(turn, role, claimed, commands)
     weapons = turn.weapons()
     if weapons:
         tower = min(
@@ -675,6 +683,29 @@ def _recall_to_tower(
     if role.pos != target and distance(role.pos, target) <= 1:
         return False
     return _walk_adjacent(turn, role, target, claimed, commands)
+
+
+def _walk_onto(
+    turn: World,
+    role: Unit,
+    target: Pos,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    """走到目标格上。已经站在上面则不再移动。"""
+    if role.pos == target:
+        claimed.add(target)
+        return True
+    step = next_step(turn, role, target)
+    if step is None or step in claimed:
+        turn.note(
+            f"角色 {role.unit_id} 无法走上 ({target.x},{target.y})"
+        )
+        return False
+    claimed.add(step)
+    claimed.add(target)
+    commands[role.unit_id] = move_command(step)
+    return True
 
 
 def _nearest_mine(
@@ -723,9 +754,15 @@ def _build_walls(
         sites = list(walls_missing)
         if preferred is not None and preferred in walls_missing:
             sites = [preferred] + [site for site in walls_missing if site != preferred]
-        for site in sites:
-            if site in claimed:
-                continue
+        adjacent = [
+            site for site in sites
+            if site not in claimed and role.pos != site and distance(role.pos, site) <= 1
+        ]
+        # 已经贴着计划墙就地砌,按顺时针取最早的那一格,避免绕去弧线另一头。
+        ordered = adjacent or [
+            site for site in sites if site not in claimed
+        ]
+        for site in ordered:
             if _build_or_walk(turn, role, site, WALL, claimed, commands):
                 if (
                     role.unit_id in commands
@@ -778,7 +815,7 @@ def _pioneer_day(
             memory, role, KIND_RECALL, target=_recall_target(turn),
             round_no=turn.round_no,
         )
-        _recall_to_tower(turn, role, claimed, commands)
+        _recall_to_tower(turn, role, claimed, commands, memory)
         return "", _maybe_prompt(turn, memory)
     if _try_accept_task(turn, role, claimed, commands, memory):
         return "", _maybe_prompt(turn, memory)
@@ -870,54 +907,188 @@ def _run_pioneer_job(
     if job.kind == KIND_PHASE:
         return _run_task(turn, role, memory, claimed, commands)
     if job.kind == KIND_RECALL:
-        _recall_to_tower(turn, role, claimed, commands)
+        _recall_to_tower(turn, role, claimed, commands, memory)
         return "", _maybe_prompt(turn, memory)
     return "", _maybe_prompt(turn, memory)
 
 
-def _sticky_weapon_pairs(
-    heroes: list[Unit],
-    weapons: tuple[Unit, ...],
-    memory,
-    turn: World,
-) -> list[tuple[Unit, Unit]]:
-    pairs: list[tuple[Unit, Unit]] = []
-    used_h: set[int] = set()
-    used_w: set[int] = set()
-    tower_map = {tower.unit_id: tower for tower in weapons}
+def _pattern_ready(turn: World) -> bool:
+    """三座火箭都落在口袋炮位上,炮手才能站进中间格轮流开。"""
+    sites = _tower_sites(turn)
+    if len(sites) < 3:
+        return False
+    have = {unit.pos for unit in turn.weapons()}
+    return all(site in have for site in sites)
+
+
+def _is_gunner(turn: World, role: Unit, memory) -> bool:
+    gunner = _select_gunner(turn, list(turn.controllable()), memory)
+    return gunner is not None and gunner.unit_id == role.unit_id
+
+
+def _select_gunner(turn: World, heroes: list[Unit], memory) -> Unit | None:
+    """只留一名炮手。已有操炮任务的人继续;否则优先贴着武器的工人。"""
+    if not heroes:
+        return None
+    alive = {hero.unit_id for hero in heroes}
     for hero in heroes:
         job = get_job(memory, hero.unit_id)
-        if job is None or job.kind != KIND_MAN_TOWER:
-            continue
-        tower = tower_map.get(job.tower_id)
-        if tower is None or tower.unit_id in used_w:
-            continue
-        pairs.append((hero, tower))
-        used_h.add(hero.unit_id)
-        used_w.add(tower.unit_id)
-    rest_h = [hero for hero in heroes if hero.unit_id not in used_h]
-    rest_w = tuple(tower for tower in weapons if tower.unit_id not in used_w)
-    pairs.extend(_assign_weapons(rest_h, rest_w))
-    for hero, tower in pairs:
-        prev = get_job(memory, hero.unit_id)
         if (
-            prev is not None
-            and prev.kind == KIND_MAN_TOWER
-            and prev.tower_id == tower.unit_id
+            job is not None
+            and job.kind == KIND_MAN_TOWER
+            and hero.unit_id in alive
         ):
-            prev.target = tower.pos
+            return hero
+    stand = _gun_stand(turn)
+    pattern = _pattern_ready(turn)
+    weapons = turn.weapons()
+
+    def key(hero: Unit) -> tuple:
+        worker = 0 if hero.kind == "worker" else 1
+        if pattern and stand is not None:
+            return (worker, distance(hero.pos, stand), hero.unit_id)
+        if weapons:
+            adjacent = 0 if any(
+                distance(hero.pos, tower.pos) <= 1 for tower in weapons
+            ) else 1
+            near = min(distance(hero.pos, tower.pos) for tower in weapons)
+            return (worker, adjacent, near, hero.unit_id)
+        if stand is not None:
+            return (worker, distance(hero.pos, stand), hero.unit_id)
+        return (worker, hero.unit_id)
+
+    return min(heroes, key=key)
+
+
+def _keep_gunner(memory, role: Unit, turn: World, target: Pos | None, tower_id: int) -> None:
+    prev = get_job(memory, role.unit_id)
+    if tower_id == 0 and prev is not None and prev.kind == KIND_MAN_TOWER:
+        tower_id = prev.tower_id
+    set_job(
+        memory,
+        role.unit_id,
+        Job(
+            kind=KIND_MAN_TOWER,
+            target=target,
+            tower_id=tower_id,
+            started=prev.started if prev is not None and prev.kind == KIND_MAN_TOWER else turn.round_no,
+        ),
+    )
+
+
+def _rotate_weapons(weapons: list[Unit], last_id: int) -> list[Unit]:
+    if not weapons or last_id <= 0:
+        return weapons
+    ids = [tower.unit_id for tower in weapons]
+    if last_id not in ids:
+        return weapons
+    index = ids.index(last_id)
+    rotated = weapons[index + 1:] + weapons[:index]
+    return rotated + [weapons[index]]
+
+
+def _fire_one(
+    turn: World,
+    role: Unit,
+    memory,
+    commands: dict[int, dict[str, Any]],
+    anchor: Pos | None,
+) -> bool:
+    """同一回合只开一门已冷却、且射程内有目标的武器。"""
+    sites = list(_tower_sites(turn))
+    ready = [
+        tower for tower in turn.weapons()
+        if distance(role.pos, tower.pos) <= 1 and tower.cooldown <= 0
+    ]
+
+    def order(tower: Unit) -> tuple:
+        try:
+            index = sites.index(tower.pos)
+        except ValueError:
+            index = 99
+        return (index, tower.unit_id)
+
+    ready.sort(key=order)
+    prev = get_job(memory, role.unit_id)
+    last_id = prev.tower_id if prev is not None and prev.kind == KIND_MAN_TOWER else 0
+    for tower in _rotate_weapons(ready, last_id):
+        if tower.cooldown > 0:
             continue
-        set_job(
-            memory,
-            hero.unit_id,
-            Job(
-                kind=KIND_MAN_TOWER,
-                target=tower.pos,
-                tower_id=tower.unit_id,
-                started=turn.round_no,
-            ),
-        )
-    return pairs
+        targets = attack_positions(turn, tower)
+        if not targets:
+            continue
+        commands[tower.unit_id] = attack_commands(role.unit_id, targets)
+        _keep_gunner(memory, role, turn, anchor or tower.pos, tower.unit_id)
+        return True
+    if ready:
+        turn.note(f"炮手 {role.unit_id} 贴着武器,但射程内没有可打的机器人")
+    elif any(distance(role.pos, tower.pos) <= 1 for tower in turn.weapons()):
+        cooling = [
+            tower for tower in turn.weapons()
+            if distance(role.pos, tower.pos) <= 1 and tower.cooldown > 0
+        ]
+        if cooling:
+            turn.note(
+                "武器仍在冷却 "
+                + ",".join(f"{tower.unit_id}:{tower.cooldown}" for tower in cooling)
+            )
+    _keep_gunner(memory, role, turn, anchor, last_id)
+    return False
+
+
+def _man_battery(
+    turn: World,
+    role: Unit,
+    memory,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> None:
+    stand = _gun_stand(turn)
+    if stand is None:
+        _man_single(turn, role, memory, claimed, commands)
+        return
+    if role.pos != stand:
+        _keep_gunner(memory, role, turn, stand, 0)
+        _walk_onto(turn, role, stand, claimed, commands)
+        return
+    _fire_one(turn, role, memory, commands, stand)
+
+
+def _man_single(
+    turn: World,
+    role: Unit,
+    memory,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> None:
+    """口袋还没建成时,一名炮手去贴最近的一座已有武器。"""
+    weapons = turn.weapons()
+    if not weapons:
+        return
+    job = get_job(memory, role.unit_id)
+    tower = None
+    if job is not None and job.kind == KIND_MAN_TOWER and job.tower_id:
+        tower = next((item for item in weapons if item.unit_id == job.tower_id), None)
+    if tower is None:
+        tower = min(weapons, key=lambda item: (distance(role.pos, item.pos), item.unit_id))
+    _keep_gunner(memory, role, turn, tower.pos, tower.unit_id)
+    if distance(role.pos, tower.pos) <= 1:
+        if tower.cooldown > 0:
+            turn.note(
+                f"武器 {tower.unit_id} 仍在冷却 cooldown={tower.cooldown}，本回合不能 attack"
+            )
+            return
+        targets = attack_positions(turn, tower)
+        if targets:
+            commands[tower.unit_id] = attack_commands(role.unit_id, targets)
+        else:
+            turn.note(
+                f"角色 {role.unit_id} 已贴塔 {tower.unit_id} 待命（射程内无目标）"
+            )
+        return
+    step = _step_toward(turn, role, tower.pos, claimed)
+    if step is not None:
+        commands[role.unit_id] = move_command(step)
 
 
 def _night(
@@ -943,28 +1114,22 @@ def _night(
             continue
         if _try_heal(role, commands):
             busy.add(role.unit_id)
+    heroes = [role for role in turn.controllable() if role.unit_id not in busy]
+    gunner = _select_gunner(turn, heroes, memory)
+    if gunner is not None and turn.weapons():
+        if _pattern_ready(turn):
+            _man_battery(turn, gunner, memory, claimed, commands)
+        else:
+            _man_single(turn, gunner, memory, claimed, commands)
+        busy.add(gunner.unit_id)
+    for role in heroes:
+        if role.unit_id in busy:
             continue
         if _try_night_item(turn, role, commands):
             busy.add(role.unit_id)
-    free = [role for role in turn.controllable() if role.unit_id not in busy]
-    for role, tower in _sticky_weapon_pairs(free, turn.weapons(), memory, turn):
-        if distance(role.pos, tower.pos) <= 1:
-            if tower.cooldown > 0:
-                turn.note(
-                    f"武器 {tower.unit_id} 仍在冷却 cooldown={tower.cooldown}，本回合不能 attack"
-                )
-                continue
-            targets = attack_positions(turn, tower)
-            if targets:
-                commands[tower.unit_id] = attack_commands(role.unit_id, targets)
-            else:
-                turn.note(
-                    f"角色 {role.unit_id} 已贴塔 {tower.unit_id} 待命（射程内无目标）"
-                )
             continue
-        step = _step_toward(turn, role, tower.pos, claimed)
-        if step is not None:
-            commands[role.unit_id] = move_command(step)
+        if _pattern_ready(turn):
+            _park_behind(turn, role, claimed, commands)
     if not prompt:
         prompt = _maybe_prompt(turn, memory)
     return execute_cmd, prompt
@@ -1002,7 +1167,7 @@ def _fill_idle(turn: World, memory, commands: dict[int, dict[str, Any]]) -> None
             continue
         if turn.is_day and role.kind == "pioneer" and _near_own_task(turn, role):
             continue
-        _recall_to_tower(turn, role, claimed, commands)
+        _recall_to_tower(turn, role, claimed, commands, memory)
 
 
 def _maybe_prompt(turn: World, memory) -> str:
@@ -1471,29 +1636,72 @@ def _map_center(turn: World) -> Pos:
     return Pos(turn.width // 2, turn.height // 2)
 
 
+def _battery_cells(turn: World) -> tuple[tuple[Pos, ...], Pos | None]:
+    """朝敌口袋:三门火箭加中间一格空地。
+
+    挑战者(朝东)相对基地左上角:
+        基地 基地 火箭
+        基地 基地 空地
+        空地 空地 火箭 火箭
+    防守者把同一形状转到西北角。人必须站在那格空地上,才能同时挨到三门炮。
+    """
+    station = turn.station()
+    if station is None:
+        return (), None
+    sx, sy = station.pos.x, station.pos.y
+    if _center_facing_east(turn):
+        rockets = (Pos(sx + 2, sy), Pos(sx + 2, sy - 2), Pos(sx + 3, sy - 2))
+        stand = Pos(sx + 2, sy - 1)
+    else:
+        rockets = (Pos(sx - 1, sy - 1), Pos(sx - 1, sy + 1), Pos(sx - 2, sy + 1))
+        stand = Pos(sx - 1, sy)
+    footprint = set(station_footprint(station.pos))
+    rockets = tuple(
+        pos for pos in rockets if turn.land(pos) and pos not in footprint
+    )
+    if not turn.land(stand) or stand in footprint:
+        stand = None
+    return rockets, stand
+
+
 def _tower_sites(turn: World) -> tuple[Pos, ...]:
+    rockets, _stand = _battery_cells(turn)
+    return rockets
+
+
+def _gun_stand(turn: World) -> Pos | None:
+    _rockets, stand = _battery_cells(turn)
+    return stand
+
+
+def _back_cells(turn: World) -> tuple[Pos, ...]:
+    """炮口朝向的背面,给不操炮的人站,避免堵住中间那格。"""
     station = turn.station()
     if station is None:
         return ()
-    footprint = station_footprint(station.pos)
-    center = _map_center(turn)
-    cells = [
-        pos for pos in _cells_at_distance(station.pos, 1) if turn.land(pos)
-    ]
-    station_x = station.pos.x
-    front_half = [p for p in cells if p.x >= station_x]
-    back_half = [p for p in cells if p.x < station_x]
-    front_half.sort(key=lambda pos: (distance(pos, center), pos.x, pos.y))
-    back_half.sort(key=lambda pos: (distance(pos, center), pos.x, pos.y))
-    result = []
-    while len(result) < 3 and (front_half or back_half):
-        if len(result) < 2 and front_half:
-            result.append(front_half.pop(0))
-        elif back_half:
-            result.append(back_half.pop(0))
-        elif front_half:
-            result.append(front_half.pop(0))
-    return tuple(result)
+    sx, sy = station.pos.x, station.pos.y
+    if _center_facing_east(turn):
+        raw = (Pos(sx - 1, sy), Pos(sx - 1, sy - 1))
+    else:
+        raw = (Pos(sx + 2, sy), Pos(sx + 2, sy - 1))
+    footprint = set(station_footprint(station.pos))
+    return tuple(pos for pos in raw if turn.land(pos) and pos not in footprint)
+
+
+def _park_behind(
+    turn: World,
+    role: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    cells = [pos for pos in _back_cells(turn) if pos == role.pos or pos not in claimed]
+    if not cells:
+        return False
+    if role.pos in cells:
+        claimed.add(role.pos)
+        return True
+    target = min(cells, key=lambda pos: (distance(role.pos, pos), pos.x, pos.y))
+    return _walk_onto(turn, role, target, claimed, commands)
 
 
 def _station_bounds(turn: World) -> tuple[int, int, int, int] | None:
@@ -1542,21 +1750,83 @@ def _on_incoming_side(pos: Pos, turn: World) -> bool:
     return pos.x < mid_x
 
 
-def _wall_order(turn: World) -> tuple[Pos, ...]:
-    """第一天目标墙位:按左右朝向地图中心的约一半围墙,由近到远建造。
+def _ring_clockwise(turn: World) -> tuple[Pos, ...]:
+    """围墙外圈按顺时针走一圈。y 向上时:上边向东,右边向南,下边向西,左边向北。"""
+    ring = set(_wall_ring(turn))
+    if not ring:
+        return ()
+    minx = min(pos.x for pos in ring)
+    maxx = max(pos.x for pos in ring)
+    miny = min(pos.y for pos in ring)
+    maxy = max(pos.y for pos in ring)
+    path: list[Pos] = []
+    for x in range(minx, maxx + 1):
+        path.append(Pos(x, maxy))
+    for y in range(maxy - 1, miny - 1, -1):
+        path.append(Pos(maxx, y))
+    for x in range(maxx - 1, minx - 1, -1):
+        path.append(Pos(x, miny))
+    for y in range(miny + 1, maxy):
+        path.append(Pos(minx, y))
+    ordered: list[Pos] = []
+    seen: set[Pos] = set()
+    for pos in path:
+        if pos in ring and pos not in seen:
+            ordered.append(pos)
+            seen.add(pos)
+    for pos in ring:
+        if pos not in seen:
+            ordered.append(pos)
+    return tuple(ordered)
 
-    来敌方向只看东西。左上挑战者砌东半圈,右下防守者砌西半圈;
-    南北边只保留靠中心的那一半,远离中心的半圈留作出入口。
+
+def _contiguous_arc(ring: tuple[Pos, ...], keep: set[Pos]) -> tuple[Pos, ...]:
+    """从缺口后面开始,沿环取出连续的一段。"""
+    if not ring:
+        return ()
+    flags = [pos in keep for pos in ring]
+    if not any(flags):
+        return ()
+    if all(flags):
+        return ring
+    n = len(ring)
+    start = None
+    for index, flag in enumerate(flags):
+        if flag and not flags[(index - 1) % n]:
+            start = index
+            break
+    if start is None:
+        return ()
+    arc: list[Pos] = []
+    index = start
+    while flags[index]:
+        arc.append(ring[index])
+        index = (index + 1) % n
+        if len(arc) >= n:
+            break
+    return tuple(arc)
+
+
+def _wall_order(turn: World) -> tuple[Pos, ...]:
+    """朝向地图中心的半圈围墙,沿外圈顺时针连续砌。
+
+    来敌方向只看东西。左上挑战者砌东半圈,右下防守者砌西半圈。
+    落在火箭口袋上的格子留给炮,不再砌墙。
     """
-    center = _map_center(turn)
-    chosen = [pos for pos in _wall_ring(turn) if _on_incoming_side(pos, turn)]
-    if not chosen:
-        ring = list(_wall_ring(turn))
-        ring.sort(key=lambda pos: (distance(pos, center), pos.x, pos.y))
-        quota = max(1, (len(ring) + 1) // 2) if ring else 0
-        return tuple(ring[:quota])
-    chosen.sort(key=lambda pos: (distance(pos, center), pos.x, pos.y))
-    return tuple(chosen)
+    ring = _ring_clockwise(turn)
+    incoming = {pos for pos in ring if _on_incoming_side(pos, turn)}
+    if not incoming:
+        center = _map_center(turn)
+        cells = list(_wall_ring(turn))
+        cells.sort(key=lambda pos: (distance(pos, center), pos.x, pos.y))
+        quota = max(1, (len(cells) + 1) // 2) if cells else 0
+        return tuple(cells[:quota])
+    arc = _contiguous_arc(ring, incoming)
+    blocked = set(_tower_sites(turn))
+    stand = _gun_stand(turn)
+    if stand is not None:
+        blocked.add(stand)
+    return tuple(pos for pos in arc if pos not in blocked)
 
 
 def _cells_at_distance(station_pos: Pos, radius: int) -> tuple[Pos, ...]:
@@ -1584,30 +1854,6 @@ def _neighbours(pos: Pos) -> tuple[Pos, ...]:
     return tuple(
         Pos(pos.x + dx, pos.y + dy) for dx, dy in _NEIGHBOUR_STEPS
     )
-
-
-def _assign_weapons(
-    heroes: list[Unit], weapons: tuple[Unit, ...],
-) -> list[tuple[Unit, Unit]]:
-    pairs: list[tuple[Unit, Unit]] = []
-    used_h: set[int] = set()
-    used_w: set[int] = set()
-    options = sorted(
-        (
-            (distance(hero.pos, tower.pos), hero.unit_id, tower.unit_id)
-            for hero in heroes
-            for tower in weapons
-        )
-    )
-    hero_map = {hero.unit_id: hero for hero in heroes}
-    tower_map = {tower.unit_id: tower for tower in weapons}
-    for _, hid, tid in options:
-        if hid in used_h or tid in used_w:
-            continue
-        used_h.add(hid)
-        used_w.add(tid)
-        pairs.append((hero_map[hid], tower_map[tid]))
-    return pairs
 
 
 def _adjacent_building(turn: World, role: Unit, unit: Unit) -> bool:
