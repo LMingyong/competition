@@ -5,10 +5,6 @@ from agent.protocol import Pos, distance
 from agent.world import World
 
 from tests.sandbox.world import (
-    GATLING,
-    PIONEER,
-    RAILGUN,
-    ROCKET,
     SandboxTurn,
     WORKER_1,
     WORKER_2,
@@ -31,18 +27,17 @@ def _validate(response, payload):
             assert isinstance(command.get("controllerId"), str)
 
 
-def test_night1_decide_three_towers_fire():
-    """三人贴塔时三座塔都开火,矿工不再去边缘采矿。"""
+def test_night1_decide_one_gunner_fires():
+    """第一夜只留一名炮手开火,矿工不再去边缘采矿。"""
     turn = SandboxTurn(night1())
     response = turn.decide()
     _validate(response, turn.payload)
     attacks = {
         int(key): cmd for key, cmd in response.items() if cmd["action"] == "attack"
     }
-    assert len(attacks) == 3
-    assert set(attacks) == {GATLING, RAILGUN, ROCKET}
-    controllers = {cmd["controllerId"] for cmd in attacks.values()}
-    assert controllers == {str(WORKER_1), str(PIONEER), str(WORKER_2)}
+    assert len(attacks) == 1
+    controller = next(iter(attacks.values()))["controllerId"]
+    assert controller == str(WORKER_1)
     miner = response.get(str(WORKER_2))
     if miner is not None:
         assert miner["action"] != "collect"
