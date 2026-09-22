@@ -300,6 +300,87 @@ def test_llm_json_still_wins_over_fallback():
     assert answer == ""
 
 
+def test_search_does_not_use_chinese_filename():
+    """查找命令不得用「请阅读….md」做 -name 精确匹配，改为列 *.md。"""
+    phase = "请阅读task_1_alpha.md，获取任务信息"
+    world = _world(phaseTask=phase)
+    prompt = task_prompt(world)
+    assert "-name '请阅读" not in prompt
+    assert "*.md" in prompt
+    memory = Memory()
+    execute, _ = next_task_command(world, memory)
+    assert "请阅读task_1_alpha.md" not in execute
+    assert "-name '请阅读" not in execute
+    assert "*.md" in execute or "task_1_alpha.md" in execute
+    bad = _world(
+        phaseTask=phase,
+        llmResp='{"executeCmd":"find /tmp/selfEvolutionTask -name \'请阅读task_1_alpha.md\'","taskAnswer":""}',
+    )
+    rewritten, _ = next_task_command(bad, Memory())
+    assert "请阅读task_1_alpha.md" not in rewritten
+    assert "*.md" in rewritten
+
+
+def test_timeout_switches_command_instead_of_repeating():
+    """超时后换列 md / 读文件，不把同一条失败命令再发一遍。"""
+    memory = Memory()
+    phase = "请阅读task_2_beta.md，获取任务信息"
+    first, _ = next_task_command(_world(phaseTask=phase), memory)
+    second, _ = next_task_command(
+        _world(phaseTask=phase, lastCmdResult="[TIMEOUT]\n"),
+        memory,
+    )
+    assert second
+    assert second != first
+    assert "请阅读" not in second
+    assert "*.md" in second or "task_2_beta.md" in second
+
+
+def test_repeated_failures_abandon_without_illegal_command():
+    """连续失败达到上限后不再发命令，交给外层离开任务点。"""
+    memory = Memory(task_fails=2, last_execute="find /tmp/selfEvolutionTask -name '*.md'")
+    execute, answer = next_task_command(
+        _world(phaseTask="请阅读task_1_alpha.md", lastCmdResult="[TIMEOUT]\n"),
+        memory,
+    )
+    assert execute == ""
+    assert answer == ""
+    assert memory.abandon_task is True
+
+
+def test_task_file_with_api_is_followed_then_submitted():
+    """读到题面后调用其中的 API；答案 JSON 就绪就交卷，不把题面本身交上去。"""
+    phase = "请阅读task_1_beijing.md，获取任务信息"
+    question = (
+        "查询全部文化遗产。接口 http://localhost:8899/heritage 。"
+        "提交 {city, total_count, world_heritage_count, types, oldest_era}。"
+    )
+    memory = Memory()
+    execute, answer = next_task_command(
+        _world(phaseTask=phase, lastCmdResult="[exitCode:0]\n" + question),
+        memory,
+    )
+    assert answer == ""
+    assert "localhost:8899" in execute
+    assert "请阅读task_1_beijing.md" not in execute
+    submit_execute, submit_answer = next_task_command(
+        _world(
+            phaseTask=phase,
+            lastCmdResult=(
+                '[exitCode:0]\n'
+                '{"city":"北京","total_count":3,"world_heritage_count":1,'
+                '"types":["古建"],"oldest_era":"商","extra":1}\n'
+            ),
+        ),
+        memory,
+    )
+    assert submit_execute == ""
+    parsed = __import__("json").loads(submit_answer)
+    assert parsed["city"] == "北京"
+    assert parsed["total_count"] == 3
+    assert "extra" not in parsed
+
+
 # ---------- 背包操作辅助 ----------
 
 def test_missing_treasure_items_accounts_duplicates():
