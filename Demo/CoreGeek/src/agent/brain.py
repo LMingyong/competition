@@ -1,6 +1,13 @@
-from dataclasses import dataclass, field
 from typing import Any
 
+from .blocked import (
+    account_blocked_turns as _account_blocked_turns,
+    block_record as _block_record,
+    keep_rerouted_pioneer_clear as _keep_rerouted_pioneer_clear,
+    note_direction_blocked as _note_direction_blocked,
+    remember_issued_moves as _remember_issued_moves,
+    reroute_if_blocked_two_turns,
+)
 from .combat import attack_positions, bomb_center
 from .debuglog import set_extra, write_round_log
 from .grid import next_step
@@ -100,6 +107,7 @@ def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     turn = World.load(payload)
     memory = observe(turn)
     assign_roles(turn, memory)
+    _account_blocked_turns(turn, memory)
     # 入夜前 7 回合，以及入夜后的每一个黑夜回合：打断白天建炮/建墙/采矿/升级。
     # interrupt_task 不看工单锁。炮手随后只回背后站位，其余人只进边缘安全区。
     if _in_recall(turn) or not turn.is_day:
@@ -113,6 +121,8 @@ def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
         execute_cmd, prompt = _night(turn, memory, commands)
     _fill_idle(turn, memory, commands)
     _keep_pioneer_on_task(turn, memory, commands)
+    _keep_rerouted_pioneer_clear(turn, memory, commands)
+    _remember_issued_moves(turn, memory, commands)
     scan_idle(turn, commands)
     set_extra(prompt, execute_cmd)
     write_round_log(turn, commands, prompt, execute_cmd)
@@ -1923,12 +1933,30 @@ def _walk_onto(
     if role.pos == target:
         claimed.add(target)
         return True
-    step = next_step(turn, role, target, avoid)
-    if step is None or step in claimed:
+    travel = set(avoid or ())
+    travel.update(_block_record(role.unit_id).avoid)
+    changed, step = reroute_if_blocked_two_turns(
+        turn, role, target, claimed, travel, commands,
+    )
+    if changed:
+        if step is None or step in claimed:
+            _note_direction_blocked(turn, role, target, claimed)
+            turn.note(
+                f"角色 {role.unit_id} 无法走上 ({target.x},{target.y})"
+            )
+            return False
+        claimed.add(step)
+        claimed.add(target)
+        commands[role.unit_id] = move_command(step)
+        return True
+    step = next_step(turn, role, target, travel or None)
+    if step is None or step in claimed or step == role.pos:
+        _note_direction_blocked(turn, role, target, claimed)
         turn.note(
             f"角色 {role.unit_id} 无法走上 ({target.x},{target.y})"
         )
         return False
+    _block_record(role.unit_id).pending_goal = target
     claimed.add(step)
     claimed.add(target)
     commands[role.unit_id] = move_command(step)
@@ -2926,6 +2954,7 @@ def _step_toward(
     *,
     inside_only: bool = False,
 ) -> Pos | None:
+    # 人站上还没建成的火箭格就建不了,第二天又会被挤回站位。
     avoid_set: set[Pos] = set()
     if _night_shift(turn) and target != _gun_stand(turn):
         avoid_set.update(_battery_block(turn))
@@ -2933,9 +2962,24 @@ def _step_toward(
         stand_cell = _gun_stand(turn)
         if stand_cell is not None and stand_cell != target:
             avoid_set.add(stand_cell)
-        # 人站上还没建成的火箭格就建不了,第二天又会被挤回站位。
         if _opening_rockets_pending(turn):
             avoid_set.update(_unbuilt_rocket_sites(turn))
+    rec = _block_record(role.unit_id)
+    avoid_set.update(rec.avoid)
+    if distance(role.pos, target) > 1:
+        changed, alt = reroute_if_blocked_two_turns(
+            turn, role, target, claimed, avoid_set, None,
+        )
+        if changed:
+            if alt is not None and alt not in claimed:
+                claimed.add(alt)
+                return alt
+            _note_direction_blocked(turn, role, target, claimed)
+            turn.note(
+                f"角色 {role.unit_id} 无法走向 ({target.x},{target.y})："
+                "周围落脚点被占、越界、或被建筑/中立单位/机器人挡住"
+            )
+            return None
     avoid = avoid_set or None
     for stand in _stand_cells(turn, role, target, claimed, inside_only):
         if stand == role.pos:
@@ -2945,8 +2989,10 @@ def _step_toward(
         step = next_step(turn, role, stand, avoid)
         if step is None or step in claimed:
             continue
+        rec.pending_goal = target
         claimed.add(step)
         return step
+    _note_direction_blocked(turn, role, target, claimed)
     turn.note(
         f"角色 {role.unit_id} 无法走向 ({target.x},{target.y})："
         "周围落脚点被占、越界、或被建筑/中立单位/机器人挡住"
