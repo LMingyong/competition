@@ -118,14 +118,14 @@ def test_day1_wall_quota_is_about_half(make_payload):
 
 
 def test_tower_sites_form_one_pocket(make_payload):
-    """三门火箭翻到基地背后,仍围住中间一格空地,站上去能同时挨到三门。"""
+    """三门火箭围住中间一格空地,站上去能同时挨到三门。"""
     payload = make_payload(roundNo=1)
     payload = _strip_roles(payload)
     world = World.load(payload)
     sites = _tower_sites(world)
     stand = _gun_stand(world)
-    assert sites == (Pos(9, 24), Pos(9, 22), Pos(8, 22))
-    assert stand == Pos(9, 23)
+    assert sites == (Pos(12, 24), Pos(12, 22), Pos(13, 22))
+    assert stand == Pos(12, 23)
     assert stand is not None
     assert all(distance(stand, site) == 1 for site in sites)
 
@@ -134,31 +134,10 @@ def test_tower_sites_form_one_pocket(make_payload):
     defender = World.load(payload)
     sites = _tower_sites(defender)
     stand = _gun_stand(defender)
-    assert sites == (Pos(32, 9), Pos(32, 11), Pos(33, 11))
-    assert stand == Pos(32, 10)
+    assert sites == (Pos(29, 9), Pos(29, 11), Pos(28, 11))
+    assert stand == Pos(29, 10)
     assert stand is not None
     assert all(distance(stand, site) == 1 for site in sites)
-
-
-def test_wall_plan_follows_rear_battery(make_payload):
-    """来袭半圈不变。旧前侧火箭格回到墙计划；背后新火箭不砌进这半圈。"""
-    payload = make_payload(roundNo=1)
-    payload = _strip_roles(payload)
-    world = World.load(payload)
-    order = set(_wall_order(world))
-    assert _center_facing_sides(world) == frozenset({"east"})
-    assert Pos(13, 22) in order
-    assert Pos(8, 22) not in order
-    assert Pos(9, 24) not in order and Pos(9, 23) not in order
-
-    payload["teamOur"]["type"] = "defender"
-    _set_station(payload, 30, 10)
-    defender = World.load(payload)
-    order = set(_wall_order(defender))
-    assert _center_facing_sides(defender) == frozenset({"west"})
-    assert Pos(28, 11) in order
-    assert Pos(33, 11) not in order
-    assert Pos(32, 9) not in order and Pos(32, 10) not in order
 
 
 def test_worker_builds_wall_when_towers_done(make_payload):

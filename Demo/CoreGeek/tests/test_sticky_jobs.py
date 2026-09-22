@@ -20,6 +20,7 @@ from tests.helpers import (
 
 COPPER_NEAR = Pos(7, 2)
 COPPER_FAR = Pos(22, 26)
+NEAR_STONE = Pos(14, 3)
 SHOP = Pos(25, 20)
 TASK_1 = Pos(14, 14)
 
@@ -59,7 +60,7 @@ def _robots(*cells):
 
 
 def test_miner_keeps_copper_when_gold_still_short(make_payload):
-    """金币一直不够买武器券时,采矿 Job 不得中途换矿。"""
+    """金币一直不够买武器券时,已选中的近矿不得中途换矿。"""
     payload = fresh(make_payload(roundNo=10))
     payload["teamOur"]["goldNum"] = 20
     _park_economy(payload)
@@ -70,11 +71,11 @@ def test_miner_keeps_copper_when_gold_still_short(make_payload):
     assert action_of(first, WORKER_1) == "move"
     step1 = move_pos(first, WORKER_1)
     assert step1 is not None
-    assert distance(step1, COPPER_NEAR) < distance(start, COPPER_NEAR)
+    assert distance(step1, NEAR_STONE) < distance(start, NEAR_STONE)
     job = tasks_mod.MEMORY.jobs.get(WORKER_1)
     assert job is not None
     assert job.kind == KIND_MINE
-    assert job.target == COPPER_NEAR
+    assert job.target == NEAR_STONE
 
     place(payload, WORKER_1, step1.x, step1.y, backpack=[])
     payload["roundNo"] = 11
@@ -84,11 +85,11 @@ def test_miner_keeps_copper_when_gold_still_short(make_payload):
     stuck = tasks_mod.MEMORY.jobs.get(WORKER_1)
     assert stuck is not None
     assert stuck.kind == KIND_MINE
-    assert stuck.target == COPPER_NEAR
+    assert stuck.target == NEAR_STONE
     assert action_of(second, WORKER_1) != "buy"
     step2 = move_pos(second, WORKER_1)
     if step2 is not None:
-        assert distance(step2, COPPER_NEAR) < distance(step1, COPPER_NEAR)
+        assert distance(step2, NEAR_STONE) < distance(step1, NEAR_STONE)
         assert distance(step2, SHOP) >= distance(step1, SHOP)
 
 
@@ -116,16 +117,16 @@ def test_en_route_mine_is_not_replaced_by_shop(make_payload):
     stuck = tasks_mod.MEMORY.jobs.get(WORKER_1)
     assert stuck is not None
     assert stuck.kind == KIND_MINE
-    assert stuck.target == COPPER_NEAR
+    assert stuck.target == NEAR_STONE
     assert action_of(second, WORKER_1) != "buy"
     step2 = move_pos(second, WORKER_1)
     if step2 is not None:
-        assert distance(step2, COPPER_NEAR) < distance(step1, COPPER_NEAR)
+        assert distance(step2, NEAR_STONE) < distance(step1, NEAR_STONE)
         assert distance(step2, SHOP) >= distance(step1, SHOP)
 
 
 def test_locked_mine_collects_once_adjacent(make_payload):
-    """人已经贴着锁定的矿时,下一回合 collect,而不是因为刷新状态改去别处。"""
+    """人已经贴着锁定的近矿时,下一回合 collect,而不是因为刷新状态改去别处。"""
     payload = fresh(make_payload(roundNo=10))
     payload["teamOur"]["goldNum"] = 20
     _park_economy(payload)
@@ -133,16 +134,16 @@ def test_locked_mine_collects_once_adjacent(make_payload):
     first = decide(payload)
     _validate(first, payload)
     job = tasks_mod.MEMORY.jobs.get(WORKER_1)
-    assert job is not None and job.target == COPPER_NEAR
+    assert job is not None and job.target == NEAR_STONE
 
-    place(payload, WORKER_1, 8, 2, backpack=[])
+    place(payload, WORKER_1, 14, 4, backpack=[])
     payload["roundNo"] = 11
     payload["teamOur"]["goldNum"] = 200
     second = decide(payload)
     _validate(second, payload)
     assert action_of(second, WORKER_1) == "collect"
     target = second[str(WORKER_1)]["targetPos"][0]
-    assert (target["x"], target["y"]) == (COPPER_NEAR.x, COPPER_NEAR.y)
+    assert (target["x"], target["y"]) == (NEAR_STONE.x, NEAR_STONE.y)
 
 
 def test_failed_collect_walks_off_blocked_adjacent_mine(make_payload):
@@ -300,8 +301,8 @@ def test_locked_tower_spend_updates_gold_for_next_worker(make_payload):
     payload["teamOur"]["goldNum"] = 25
     sites = _tower_sites(World.load(payload))
     assert len(sites) >= 2
-    place(payload, WORKER_1, 8, 24, backpack=[])
-    place(payload, WORKER_2, 10, 22, backpack=[])
+    place(payload, WORKER_1, 13, 24, backpack=[])
+    place(payload, WORKER_2, 11, 21, backpack=[])
     tasks_mod.MEMORY.jobs[WORKER_1] = Job(
         kind=KIND_TOWER, target=sites[0], name="rocket", started=10,
     )

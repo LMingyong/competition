@@ -121,17 +121,17 @@ def test_three_heroes_only_one_fires(make_payload):
 def test_gunner_on_pocket_rotates_rockets(make_payload):
     """人站在口袋空地上时,同一回合只开一门;冷却的那门换下一门。"""
     payload = fresh(make_payload(roundNo=85, phaseTask=""))
-    cells = ((9, 24), (9, 22), (8, 22))
+    cells = ((12, 24), (12, 22), (13, 22))
     for unit_id, (x, y) in zip((GATLING, RAILGUN, ROCKET), cells):
         place(
             payload, unit_id, x, y,
             roleType="rocket", cooldown=0, level=1,
             attackRange=10, attackPower=20, health=1000,
         )
-    place(payload, WORKER_1, 9, 23, backpack=[], health=220)
+    place(payload, WORKER_1, 12, 23, backpack=[], health=220)
     place(payload, WORKER_2, 4, 4, backpack=[], health=220)
     place(payload, PIONEER, 5, 5, backpack=["Medicine"], health=200)
-    payload["robot"] = _robots((18, 22))
+    payload["robot"] = _robots((20, 16))
     first = decide(payload)
     _validate(first, payload)
     attacks = [(key, cmd) for key, cmd in first.items() if cmd["action"] == "attack"]
@@ -156,7 +156,7 @@ def test_gunner_on_pocket_rotates_rockets(make_payload):
 def test_recall_gunner_walks_toward_pocket(make_payload):
     """口袋三门火箭已建成时,回防窗口炮手往中间空地走。"""
     payload = fresh(make_payload(roundNo=66, phaseTask=""))
-    cells = ((9, 24), (9, 22), (8, 22))
+    cells = ((12, 24), (12, 22), (13, 22))
     for unit_id, (x, y) in zip((GATLING, RAILGUN, ROCKET), cells):
         place(
             payload, unit_id, x, y,
@@ -170,31 +170,31 @@ def test_recall_gunner_walks_toward_pocket(make_payload):
     _validate(response, payload)
     step = move_pos(response, WORKER_2)
     assert step is not None
-    stand = Pos(9, 23)
+    stand = Pos(12, 23)
     assert distance(step, stand) < distance(Pos(6, 6), stand)
 
 
 def test_night_only_one_fires_and_others_stay_off_stand(make_payload):
-    """夜里仍只有一人开火;另外两人走向基地朝敌一侧,不占背后站位。"""
+    """夜里仍只有一人开火;另外两人走向站位背后,不占中间空地。"""
     payload = fresh(make_payload(roundNo=85, phaseTask=""))
-    cells = ((9, 24), (9, 22), (8, 22))
+    cells = ((12, 24), (12, 22), (13, 22))
     for unit_id, (x, y) in zip((GATLING, RAILGUN, ROCKET), cells):
         place(
             payload, unit_id, x, y,
             roleType="rocket", cooldown=0, level=1,
             attackRange=10, attackPower=20, health=1000,
         )
-    place(payload, WORKER_1, 9, 23, backpack=[], health=220)
+    place(payload, WORKER_1, 12, 23, backpack=[], health=220)
     place(payload, WORKER_2, 4, 4, backpack=[], health=220)
     place(payload, PIONEER, 5, 5, backpack=["Medicine"], health=200)
-    payload["robot"] = _robots((18, 22))
+    payload["robot"] = _robots((20, 16))
     response = decide(payload)
     _validate(response, payload)
     attacks = [cmd for cmd in response.values() if cmd["action"] == "attack"]
     assert len(attacks) == 1
     assert attacks[0]["controllerId"] == str(WORKER_1)
-    stand = Pos(9, 23)
-    backs = (Pos(12, 24), Pos(12, 23))
+    stand = Pos(12, 23)
+    backs = (Pos(9, 24), Pos(9, 23))
     for uid, start in ((WORKER_2, Pos(4, 4)), (PIONEER, Pos(5, 5))):
         step = move_pos(response, uid)
         assert step != stand
@@ -205,33 +205,33 @@ def test_night_only_one_fires_and_others_stay_off_stand(make_payload):
 
 
 def test_night_edge_miner_parks_behind_instead_of_mining(make_payload):
-    """夜里即使上一回合还在采边缘矿,也改停到基地朝敌一侧,不占站位和火箭格。"""
+    """夜里即使上一回合还在采边缘矿,也改停到基地背后,不占站位。"""
     import agent.tasks as tasks_mod
     from agent.jobs import KIND_MINE, Job
 
     payload = fresh(make_payload(roundNo=85, phaseTask=""))
-    cells = ((9, 24), (9, 22), (8, 22))
+    cells = ((12, 24), (12, 22), (13, 22))
     for unit_id, (x, y) in zip((GATLING, RAILGUN, ROCKET), cells):
         place(
             payload, unit_id, x, y,
             roleType="rocket", cooldown=0, level=1,
             attackRange=10, attackPower=20, health=1000,
         )
-    place(payload, WORKER_1, 9, 23, backpack=[], health=220)
+    place(payload, WORKER_1, 12, 23, backpack=[], health=220)
     place(payload, WORKER_2, 8, 3, backpack=[], health=220)
     place(payload, PIONEER, 5, 5, backpack=["Medicine"], health=200)
     tasks_mod.MEMORY.jobs[WORKER_2] = Job(
         kind=KIND_MINE, target=Pos(7, 2), name="copper", started=80,
     )
-    payload["robot"] = _robots((18, 22))
+    payload["robot"] = _robots((20, 16))
     response = decide(payload)
     _validate(response, payload)
     attacks = [cmd for cmd in response.values() if cmd["action"] == "attack"]
     assert len(attacks) == 1
     assert attacks[0]["controllerId"] == str(WORKER_1)
     assert action_of(response, WORKER_2) != "collect"
-    stand = Pos(9, 23)
-    backs = (Pos(12, 24), Pos(12, 23))
+    stand = Pos(12, 23)
+    backs = (Pos(9, 24), Pos(9, 23))
     start = Pos(8, 3)
     step = move_pos(response, WORKER_2)
     assert step is not None and step != stand
