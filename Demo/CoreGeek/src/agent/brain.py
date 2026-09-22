@@ -92,6 +92,7 @@ def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     else:
         execute_cmd, prompt = _night(turn, memory, commands)
     _fill_idle(turn, memory, commands)
+    _keep_pioneer_on_task(turn, memory, commands)
     scan_idle(turn, commands)
     set_extra(prompt, execute_cmd)
     write_round_log(turn, commands, prompt, execute_cmd)
@@ -1006,6 +1007,9 @@ def _pioneer_day(
     if turn.phase_task:
         _keep_job(memory, role, KIND_PHASE, round_no=turn.round_no)
         return _run_task(turn, role, memory, claimed, commands)
+    if _just_accepted(turn, role, memory):
+        # 接任务的下一回合题面可能还没写进 phaseTask，人也不能走开。
+        return "", ""
     if _should_home(turn, role, memory):
         _recall_to_tower(turn, role, claimed, commands, memory)
         return "", _maybe_prompt(turn, memory)
@@ -1048,11 +1052,19 @@ def _run_task(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
 ) -> tuple[str, str]:
+    if memory.abandon_task:
+        _walk_to_other_task(turn, role, claimed, commands)
+        return "", ""
     execute_cmd, answer = next_task_command(turn, memory)
+    if memory.abandon_task:
+        _walk_to_other_task(turn, role, claimed, commands)
+        return "", ""
     if answer:
         commands[role.unit_id] = submit_answer_command(answer)
         execute_cmd = ""
-    elif not _near_own_task(turn, role):
+    elif _near_own_task(turn, role):
+        pass
+    else:
         _walk_to_task(turn, role, claimed, commands)
         execute_cmd = ""
     prompt = ""
@@ -1298,22 +1310,20 @@ def _night(
     busy: set[int] = set()
     execute_cmd = ""
     prompt = ""
-    if turn.phase_task:
-        pioneer = turn.pioneer()
-        if pioneer is not None:
-            execute_cmd, answer = next_task_command(turn, memory)
-            if answer:
-                commands[pioneer.unit_id] = submit_answer_command(answer)
-                busy.add(pioneer.unit_id)
-                execute_cmd = ""
-            if can_prompt(turn, memory):
-                prompt = task_prompt(turn)
-                mark_prompt(turn, memory)
     for role in turn.controllable():
-        if role.unit_id in busy:
-            continue
         if _try_heal(role, commands):
             busy.add(role.unit_id)
+    pioneer = turn.pioneer()
+    if pioneer is not None and pioneer.unit_id not in busy and (
+        turn.phase_task or _just_accepted(turn, pioneer, memory)
+    ):
+        # 任务还在就不要把开拓者选成炮手，也不要停去基地背后。
+        if turn.phase_task:
+            _keep_job(memory, pioneer, KIND_PHASE, round_no=turn.round_no)
+            execute_cmd, prompt = _run_task(
+                turn, pioneer, memory, claimed, commands,
+            )
+        busy.add(pioneer.unit_id)
     heroes = [role for role in turn.controllable() if role.unit_id not in busy]
     gunner = _select_gunner(turn, heroes, memory)
     if gunner is not None and turn.weapons():
@@ -1364,6 +1374,10 @@ def _fill_idle(turn: World, memory, commands: dict[int, dict[str, Any]]) -> None
         if role.unit_id in busy:
             continue
         if any(distance(role.pos, tower.pos) <= 1 for tower in turn.weapons()):
+            continue
+        if role.kind == "pioneer" and (
+            turn.phase_task or _just_accepted(turn, role, memory)
+        ):
             continue
         if turn.is_day and role.kind == "pioneer" and _near_own_task(turn, role):
             continue
@@ -1553,6 +1567,8 @@ def _try_accept_task(
         )
     if _near_own_task(turn, role) and valid:
         commands[role.unit_id] = accept_task_command()
+        if memory is not None:
+            memory.accepted_round = turn.round_no
         return True
     if turn.adjacent_to_zone(role, target) and not valid:
         return True
@@ -1599,6 +1615,65 @@ def _walk_to_task(
     if not cells:
         return False
     target = min(cells, key=lambda pos: distance(role.pos, pos))
+    return _walk_adjacent(turn, role, target, claimed, commands)
+
+
+def _just_accepted(turn: World, role: Unit, memory) -> bool:
+    """上一回合刚 acceptTask 成功，这一回合必须还站在任务点上。"""
+    accepted = int(getattr(memory, "accepted_round", 0) or 0)
+    if accepted <= 0 or turn.round_no != accepted + 1:
+        return False
+    if turn.last_ok(role.unit_id) is False:
+        return False
+    return _near_own_task(turn, role)
+
+
+def _keep_pioneer_on_task(turn: World, memory, commands: dict[int, dict[str, Any]]) -> None:
+    """任务未结束时，抹掉会离开任务点周围一格的移动。"""
+    if memory.abandon_task:
+        return
+    pioneer = turn.pioneer()
+    if pioneer is None:
+        return
+    if not turn.phase_task and not _just_accepted(turn, pioneer, memory):
+        return
+    if not _near_own_task(turn, pioneer):
+        return
+    command = commands.get(pioneer.unit_id)
+    if not command or command.get("action") != "move":
+        return
+    raw = (command.get("targetPos") or [None])[0]
+    if not isinstance(raw, dict):
+        return
+    step = Pos(int(raw["x"]), int(raw["y"]))
+    cells = turn.own_task_zones() or tuple(task.pos for task in turn.player_tasks)
+    if cells and all(distance(step, cell) > 1 for cell in cells):
+        commands.pop(pioneer.unit_id, None)
+
+
+def _walk_to_other_task(
+    turn: World,
+    role: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    """连续失败后离开当前任务点，去另一个任务点。离开即结束本题。"""
+    cells = list(turn.own_task_zones() or tuple(task.pos for task in turn.player_tasks))
+    if not cells:
+        return False
+    here = [pos for pos in cells if distance(role.pos, pos) <= 1]
+    others = [pos for pos in cells if pos not in here]
+    if not others:
+        anchor = here[0] if here else cells[0]
+        for dx, dy in _NEIGHBOUR_STEPS:
+            step = Pos(role.pos.x + dx, role.pos.y + dy)
+            if not turn.land(step):
+                continue
+            if all(distance(step, cell) > 1 for cell in cells):
+                commands[role.unit_id] = move_command(step)
+                return True
+        return _walk_adjacent(turn, role, anchor, claimed, commands)
+    target = min(others, key=lambda pos: (distance(role.pos, pos), pos.x, pos.y))
     return _walk_adjacent(turn, role, target, claimed, commands)
 
 

@@ -206,6 +206,75 @@ def test_late_day_pioneer_with_phase_task_stays(make_payload):
         assert step != task
 
 
+def test_recall_does_not_pull_pioneer_off_task(make_payload):
+    """回防窗口有题时开拓者停在任务点；炮手仍回炮位。"""
+    payload = fresh(make_payload(
+        roundNo=RECALL_FROM,
+        phaseTask="请阅读task_1_alpha.md，获取任务信息",
+    ))
+    payload["teamOur"]["goldNum"] = 500
+    _arm_pocket(payload)
+    fill_walls(payload)
+    place(payload, WORKER_1, 15, 20, backpack=[])
+    place(payload, WORKER_2, 8, 2, backpack=[])
+    place(payload, PIONEER, 13, 14, backpack=["Medicine"])
+    response = decide(payload)
+    _validate(response, payload)
+    assert action_of(response, PIONEER) not in {"move", "buy", "sell", "collect", "acceptTask"}
+    assert action_of(response, WORKER_1) == "move"
+    assert tasks_mod.MEMORY.jobs[WORKER_1].kind == KIND_MAN_TOWER
+
+
+def test_turn_after_accept_stays_on_task_point(make_payload):
+    """acceptTask 的下一回合，即使还没看到 phaseTask，也不为商店或回防走开。"""
+    payload = fresh(make_payload(roundNo=30, phaseTask=""))
+    payload["teamOur"]["goldNum"] = 500
+    payload["lastRoundRoleActionResults"] = {str(PIONEER): True}
+    place(payload, PIONEER, 13, 14, backpack=["Medicine"])
+    tasks_mod.MEMORY.accepted_round = 29
+    response = decide(payload)
+    _validate(response, payload)
+    assert action_of(response, PIONEER) not in {"move", "buy", "sell", "collect"}
+
+
+def test_ready_answer_submits_while_standing_on_task(make_payload):
+    """题面里的 API 结果就绪后 submitAnswer，人留在任务点。"""
+    from agent.debuglog import last_extra
+
+    phase = "请阅读task_1_beijing.md，获取任务信息"
+    question = (
+        "查询全部文化遗产。接口 http://localhost:8899/heritage 。"
+        "提交 {city, total_count, world_heritage_count, types, oldest_era}。"
+    )
+    reading = fresh(make_payload(
+        roundNo=20,
+        phaseTask=phase,
+        lastCmdResult="[exitCode:0]\n" + question,
+    ))
+    place(reading, PIONEER, 13, 14, backpack=["Medicine"])
+    first = decide(reading)
+    _validate(first, reading)
+    assert action_of(first, PIONEER) != "move"
+    assert "localhost:8899" in last_extra()["executeCmd"]
+
+    answering = fresh(make_payload(
+        roundNo=21,
+        phaseTask=phase,
+        lastCmdResult=(
+            '[exitCode:0]\n'
+            '{"city":"北京","total_count":3,"world_heritage_count":1,'
+            '"types":["古建"],"oldest_era":"商"}\n'
+        ),
+    ))
+    place(answering, PIONEER, 13, 14, backpack=["Medicine"])
+    second = decide(answering)
+    _validate(second, answering)
+    assert action_of(second, PIONEER) == "submitAnswer"
+    answer = second[str(PIONEER)]["taskAnswer"]
+    assert "total_count" in answer
+    assert "北京" in answer
+
+
 def test_early_day_worker_still_mines_or_builds(make_payload):
     """回合 10 非回防:墙已齐且贴铜矿时允许 collect,禁止全天回塔。"""
     payload = fresh(make_payload(roundNo=10))
