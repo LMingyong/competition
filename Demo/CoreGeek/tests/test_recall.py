@@ -52,7 +52,7 @@ def test_round_60_still_mines_not_recall(make_payload):
 
 
 def _arm_pocket(payload):
-    cells = ((12, 24), (12, 22), (13, 22))
+    cells = ((9, 24), (9, 22), (8, 22))
     for unit_id, (x, y) in zip((GATLING, RAILGUN, ROCKET), cells):
         place(
             payload, unit_id, x, y,
@@ -72,7 +72,7 @@ def test_midday_nobody_sent_to_gun_stand(make_payload):
     place(payload, PIONEER, 13, 14, backpack=["Medicine"])
     response = decide(payload)
     _validate(response, payload)
-    stand = Pos(12, 23)
+    stand = Pos(9, 23)
     assert action_of(response, WORKER_1) == "collect"
     assert all(cmd["action"] != "attack" for cmd in response.values())
     for uid, start in (
@@ -108,7 +108,7 @@ def test_round_63_still_before_recall_window(make_payload):
         job = tasks_mod.MEMORY.jobs.get(uid)
         if job is not None:
             assert job.kind != KIND_MAN_TOWER
-        assert move_pos(response, uid) != Pos(12, 23)
+        assert move_pos(response, uid) != Pos(9, 23)
 
 
 @pytest.mark.parametrize("round_no", [64, 194, 324])
@@ -134,7 +134,7 @@ def test_last_seven_rounds_one_gunner_others_edge_mine(make_payload, round_no):
     )
     response = decide(payload)
     _validate(response, payload)
-    stand = Pos(12, 23)
+    stand = Pos(9, 23)
     world = World.load(payload)
     assert all(cmd["action"] != "attack" for cmd in response.values())
     assert action_of(response, WORKER_1) == "move"
@@ -187,7 +187,7 @@ def test_full_backpack_does_not_cross_center_to_vendor(make_payload):
     assert _is_edge_mine(world, job.target)
     assert job.target != Pos(20, 16)
     step = move_pos(response, WORKER_2)
-    assert step != Pos(12, 23)
+    assert step != Pos(9, 23)
     if step is not None:
         assert distance(step, job.target) < distance(Pos(8, 2), job.target)
 

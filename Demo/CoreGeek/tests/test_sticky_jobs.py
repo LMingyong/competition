@@ -300,8 +300,8 @@ def test_locked_tower_spend_updates_gold_for_next_worker(make_payload):
     payload["teamOur"]["goldNum"] = 25
     sites = _tower_sites(World.load(payload))
     assert len(sites) >= 2
-    place(payload, WORKER_1, 13, 24, backpack=[])
-    place(payload, WORKER_2, 11, 21, backpack=[])
+    place(payload, WORKER_1, 8, 24, backpack=[])
+    place(payload, WORKER_2, 10, 22, backpack=[])
     tasks_mod.MEMORY.jobs[WORKER_1] = Job(
         kind=KIND_TOWER, target=sites[0], name="rocket", started=10,
     )
