@@ -21,6 +21,7 @@ env/
 # Logs
 *.log
 Log/
+logs/auto_pull.log.lock
 
 # 实时对战日志资产（真实场景下载，纳入版本管理）
 !Demo/CoreGeek/logs/teamB.log
