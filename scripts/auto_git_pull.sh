@@ -7,6 +7,8 @@
 #   ./scripts/auto_git_pull.sh --once
 #   INTERVAL=60 ./scripts/auto_git_pull.sh
 #
+# Windows 用同目录的 auto_git_pull.bat，参数相同。
+#
 # 选项：
 #   --once              只拉取一次后退出
 #   --interval <秒>     轮询间隔，默认 300，也可用环境变量 INTERVAL
