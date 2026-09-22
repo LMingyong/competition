@@ -201,7 +201,7 @@ def _worker_day(
                 commands[role.unit_id] = move_command(step)
                 return gold_left, builds_left
 
-    # 两名工人都去建三座火箭。炮位是基地朝敌一角的口袋:
+    # 两名工人都去建三座火箭。炮位在基地背后、靠近地图边缘:
     # 先建前两座,前两座落地再补最外侧那座。
     # 三塔齐后先采矿换钱、能升塔就升塔; 第 30 回合起沿圈连续砌墙。
     # 建完后升级顺序:武器 > 朝向敌人的围墙 > 其余围墙 > 基地。
@@ -407,7 +407,7 @@ def _should_home(turn: World, role: Unit, memory) -> bool:
 
 
 def _should_edge_mine(turn: World, role: Unit, memory) -> bool:
-    """回防窗口里不操炮的两人去边缘采矿。夜里改停在基地背后,不再下矿。"""
+    """回防窗口里不操炮的两人去边缘采矿。夜里改停在基地朝敌一侧,不再下矿。"""
     if not _in_recall(turn):
         return False
     return not _is_gunner(turn, role, memory)
@@ -1506,7 +1506,7 @@ def _night(
     if pioneer is not None and pioneer.unit_id not in busy and (
         turn.phase_task or _just_accepted(turn, pioneer, memory)
     ):
-        # 任务还在就不要把开拓者选成炮手，也不要停去基地背后。
+        # 任务还在就不要把开拓者选成炮手，也不要停去朝敌一侧。
         if turn.phase_task:
             _keep_job(memory, pioneer, KIND_PHASE, round_no=turn.round_no)
             execute_cmd, prompt = _run_task(
@@ -1527,7 +1527,7 @@ def _night(
         if _try_night_item(turn, role, commands):
             busy.add(role.unit_id)
             continue
-        # 夜里只有炮手占站位。其余人停到基地背后,不接着去边缘矿,也不挤进炮位。
+        # 夜里只有炮手占背后站位。其余人停在基地朝敌一侧,不占新火箭和新站位。
         _park_behind(turn, role, claimed, commands)
     if not prompt:
         prompt = _maybe_prompt(turn, memory)
@@ -2116,24 +2116,25 @@ def _map_center(turn: World) -> Pos:
 
 
 def _battery_cells(turn: World) -> tuple[tuple[Pos, ...], Pos | None]:
-    """朝敌口袋:三门火箭加中间一格空地。
+    """背敌口袋:三门火箭加中间一格空地,整组翻到基地外侧、靠近地图边缘。
 
-    挑战者(朝东)相对基地左上角:
-        基地 基地 火箭
-        基地 基地 空地
-        空地 空地 火箭 火箭
-    防守者把同一形状转到西北角。人必须站在那格空地上,才能同时挨到三门炮。
+    相对形状与原先朝敌口袋相同,只沿基地中线水平翻转。最外侧仍在切比雪夫距离 2。
+    挑战者(来敌朝东,炮在西侧)相对基地左上角:
+        火箭 基地 基地
+        空地 基地 基地
+        火箭 火箭 空地 空地
+    防守者(来敌朝西,炮在东侧)是同一形状翻到东侧。人必须站在那格空地上,才能同时挨到三门炮。
     """
     station = turn.station()
     if station is None:
         return (), None
     sx, sy = station.pos.x, station.pos.y
     if _center_facing_east(turn):
-        rockets = (Pos(sx + 2, sy), Pos(sx + 2, sy - 2), Pos(sx + 3, sy - 2))
-        stand = Pos(sx + 2, sy - 1)
+        rockets = (Pos(sx - 1, sy), Pos(sx - 1, sy - 2), Pos(sx - 2, sy - 2))
+        stand = Pos(sx - 1, sy - 1)
     else:
-        rockets = (Pos(sx - 1, sy - 1), Pos(sx - 1, sy + 1), Pos(sx - 2, sy + 1))
-        stand = Pos(sx - 1, sy)
+        rockets = (Pos(sx + 2, sy - 1), Pos(sx + 2, sy + 1), Pos(sx + 3, sy + 1))
+        stand = Pos(sx + 2, sy)
     footprint = set(station_footprint(station.pos))
     rockets = tuple(
         pos for pos in rockets if turn.land(pos) and pos not in footprint
@@ -2154,17 +2155,24 @@ def _gun_stand(turn: World) -> Pos | None:
 
 
 def _back_cells(turn: World) -> tuple[Pos, ...]:
-    """炮口朝向的背面,给不操炮的人站,避免堵住中间那格。"""
+    """炮已在基地背后。不操炮的人停在朝向敌人的一侧,避开新火箭和新站位。"""
     station = turn.station()
     if station is None:
         return ()
     sx, sy = station.pos.x, station.pos.y
     if _center_facing_east(turn):
-        raw = (Pos(sx - 1, sy), Pos(sx - 1, sy - 1))
-    else:
         raw = (Pos(sx + 2, sy), Pos(sx + 2, sy - 1))
+    else:
+        raw = (Pos(sx - 1, sy), Pos(sx - 1, sy - 1))
     footprint = set(station_footprint(station.pos))
-    return tuple(pos for pos in raw if turn.land(pos) and pos not in footprint)
+    rockets, stand = _battery_cells(turn)
+    blocked = set(rockets)
+    if stand is not None:
+        blocked.add(stand)
+    return tuple(
+        pos for pos in raw
+        if turn.land(pos) and pos not in footprint and pos not in blocked
+    )
 
 
 def _park_behind(
@@ -2290,7 +2298,7 @@ def _wall_order(turn: World) -> tuple[Pos, ...]:
     """朝向地图中心的半圈围墙,沿外圈顺时针连续砌。
 
     来敌方向只看东西。左上挑战者砌东半圈,右下防守者砌西半圈。
-    落在火箭口袋上的格子留给炮,不再砌墙。
+    落在火箭或站位上的格子留给炮,不再砌墙;炮翻到背后后,来袭半圈里空出的旧炮格重新砌上。
     """
     ring = _ring_clockwise(turn)
     incoming = {pos for pos in ring if _on_incoming_side(pos, turn)}

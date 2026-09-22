@@ -334,7 +334,7 @@ def test_later_days_do_not_rebuild_rockets_and_keep_walling(make_payload):
         payload = fresh(make_payload(roundNo=round_no))
         payload["teamOur"]["goldNum"] = 75
         drop_walls(payload)
-        cells = ((12, 24), (12, 22), (13, 22))
+        cells = ((9, 24), (9, 22), (8, 22))
         for unit_id, (x, y) in zip((GATLING, RAILGUN, ROCKET), cells):
             place(
                 payload, unit_id, x, y,

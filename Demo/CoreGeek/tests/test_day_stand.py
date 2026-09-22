@@ -18,8 +18,8 @@ from tests.helpers import (
     place,
 )
 
-STAND = Pos(12, 23)
-OUTER = Pos(13, 22)
+STAND = Pos(9, 23)
+OUTER = Pos(8, 22)
 NEAR_STONE = Pos(4, 24)
 FAR_COPPER = Pos(22, 26)
 
@@ -61,13 +61,13 @@ def _add_rocket(payload, unit_id, x, y):
 
 def _two_rockets(payload):
     _strip_weapons(payload)
-    _add_rocket(payload, 30001, 12, 24)
-    _add_rocket(payload, 30002, 12, 22)
+    _add_rocket(payload, 30001, 9, 24)
+    _add_rocket(payload, 30002, 9, 22)
 
 
 def _three_rockets(payload):
     _two_rockets(payload)
-    _add_rocket(payload, 30003, 13, 22)
+    _add_rocket(payload, 30003, 8, 22)
 
 
 def _stand_worker(payload, round_no, gold, backpack=None):
@@ -95,15 +95,15 @@ def _left_stand(response):
     return step, job
 
 
-def test_pocket_coordinates_unchanged(make_payload):
-    """样例炮位仍是朝敌口袋,没有改到基地背后。"""
+def test_pocket_coordinates_are_behind_base(make_payload):
+    """样例炮位在基地背后,施工落脚点排除的是这组新站位。"""
     world = World.load(make_payload(roundNo=40))
-    assert _tower_sites(world) == (Pos(12, 24), Pos(12, 22), OUTER)
+    assert _tower_sites(world) == (Pos(9, 24), Pos(9, 22), OUTER)
     assert _gun_stand(world) == STAND
 
 
 def test_midday_worker_on_stand_leaves_to_build_third(make_payload):
-    """前两门已建成、人站在 (12,23)、白天中段:离开站位去建第三门。"""
+    """前两门已建成、人站在 (9,23)、白天中段:离开站位去建第三门。"""
     payload = fresh(make_payload(roundNo=40))
     _two_rockets(payload)
     fill_walls(payload)
