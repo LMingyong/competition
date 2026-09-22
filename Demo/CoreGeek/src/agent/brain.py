@@ -101,9 +101,14 @@ UPGRADE_MAP = {
     "StationUpgradeVoucher1": (("station",), 1),
     "StationUpgradeVoucher2": (("station",), 2),
 }
+# 本回合已经决定要 build 的格子 -> 建造者。其他人不能 move 上去。
+_PLANNED_BUILDS: dict[Pos, int] = {}
+# 绕到炮位的路比直线远过这么多，就当成走不到，改去另一门。
+_DETOUR_SLACK = 4
 
 
 def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    _PLANNED_BUILDS.clear()
     turn = World.load(payload)
     memory = observe(turn)
     assign_roles(turn, memory)
@@ -122,6 +127,7 @@ def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     _fill_idle(turn, memory, commands)
     _keep_pioneer_on_task(turn, memory, commands)
     _keep_rerouted_pioneer_clear(turn, memory, commands)
+    _untangle_feet(turn, memory, commands)
     _remember_issued_moves(turn, memory, commands)
     scan_idle(turn, commands)
     set_extra(prompt, execute_cmd)
@@ -161,6 +167,8 @@ def _day(
             )
             handled.add(gunner.unit_id)
 
+    # 先占住本回合就要建的火箭格，开拓者排在工人前面也不会踩进去。
+    _reserve_adjacent_rocket_builds(turn, claimed)
     pioneer = turn.pioneer()
     if pioneer is not None and pioneer.unit_id not in handled:
         execute_cmd, prompt = _pioneer_day(
@@ -213,7 +221,245 @@ def _opening_command_ok(turn: World, command: dict[str, Any]) -> bool:
         return False
     if pos in _unbuilt_rocket_sites(turn):
         return False
+    if pos in _PLANNED_BUILDS:
+        return False
     return True
+
+
+def _move_avoid(turn: World, target: Pos) -> set[Pos]:
+    """白天路径不踩火箭格、站位，也不踩本回合要 build 的格子。"""
+    avoid: set[Pos] = set(_PLANNED_BUILDS)
+    if _night_shift(turn):
+        if target != _gun_stand(turn):
+            avoid.update(_battery_block(turn))
+        return avoid
+    if _day_avoids_stand(turn):
+        stand = _gun_stand(turn)
+        if stand is not None and stand != target:
+            avoid.add(stand)
+        avoid.update(_tower_sites(turn))
+    return avoid
+
+
+def _path_cost(
+    turn: World, role: Unit, goal: Pos, avoid: set[Pos], start: Pos | None = None,
+) -> int | None:
+    """与 next_step 同一套阻挡规则的步数。走不到返回 None。"""
+    origin = role.pos if start is None else start
+    if origin == goal:
+        return 0
+    from collections import deque
+
+    blocked = set(turn.blocked(role))
+    blocked.update(avoid)
+    if start is not None:
+        blocked.discard(start)
+    seen = {origin}
+    queue: deque[tuple[Pos, int]] = deque([(origin, 0)])
+    while queue:
+        current, cost = queue.popleft()
+        for dx, dy in _NEIGHBOUR_STEPS:
+            step = Pos(current.x + dx, current.y + dy)
+            if step in seen or step in blocked or not turn.land(step):
+                continue
+            if step == goal:
+                return cost + 1
+            seen.add(step)
+            queue.append((step, cost + 1))
+    return None
+
+
+def _straight_step(
+    turn: World,
+    role: Unit,
+    landing: Pos,
+    avoid: set[Pos],
+    claimed: set[Pos],
+) -> tuple[int, Pos] | None:
+    """最短路上更直的第一步。同样步数时不先往斜向绕。"""
+    cost = _path_cost(turn, role, landing, avoid)
+    if cost is None:
+        return None
+    if cost == 0:
+        return (0, role.pos)
+    blocked = set(turn.blocked(role))
+    blocked.update(avoid)
+    best: tuple[tuple[int, int, int, int, int], Pos] | None = None
+    for dx, dy in _NEIGHBOUR_STEPS:
+        step = Pos(role.pos.x + dx, role.pos.y + dy)
+        if step in blocked or step in claimed or not turn.land(step):
+            continue
+        remain = _path_cost(turn, role, landing, avoid, step)
+        if remain is None or remain + 1 != cost:
+            continue
+        key = (
+            cost,
+            abs(step.x - landing.x) + abs(step.y - landing.y),
+            distance(step, landing),
+            abs(dx) + abs(dy),
+            step.x + step.y,
+        )
+        if best is None or key < best[0]:
+            best = (key, step)
+    if best is None:
+        return None
+    return (cost, best[1])
+
+
+def _rocket_approaches(
+    turn: World,
+    role: Unit,
+    site: Pos,
+    claimed: set[Pos],
+) -> list[tuple[int, Pos, Pos]]:
+    """能走到的邻格：(路径步数, 下一步, 落脚点)。绕远的不算走得到。"""
+    avoid = _move_avoid(turn, site)
+    pads = set(_tower_sites(turn))
+    found: list[tuple[int, Pos, Pos]] = []
+    limit = distance(role.pos, site) + _DETOUR_SLACK
+    for landing in _stand_cells(turn, role, site, claimed):
+        if landing in pads or landing in _PLANNED_BUILDS or landing in avoid:
+            continue
+        if landing == role.pos:
+            found.append((0, role.pos, landing))
+            continue
+        picked = _straight_step(turn, role, landing, avoid, claimed)
+        if picked is None or picked[0] > limit or picked[1] in avoid or picked[1] == role.pos:
+            continue
+        cost, step = picked
+        found.append((cost, step, landing))
+    found.sort(
+        key=lambda item: (
+            item[0],
+            distance(role.pos, item[2]),
+            abs(item[2].x - role.pos.x) + abs(item[2].y - role.pos.y),
+            item[2].x,
+            item[2].y,
+        )
+    )
+    return found
+
+
+def _note_cannot_reach(turn: World, role: Unit, site: Pos) -> None:
+    turn.note(
+        f"角色 {role.unit_id} 无法走向 ({site.x},{site.y})："
+        "周围落脚点被占、越界、或被建筑/中立单位/机器人挡住"
+    )
+
+
+def _reserve_adjacent_rocket_builds(turn: World, claimed: set[Pos]) -> None:
+    """已经贴着缺的火箭、这一回合就会 build 的格子，先留给建造者。"""
+    if not turn.is_day or _in_recall(turn):
+        return
+    if turn.gold < WEAPON_BUILD_COST:
+        return
+    sites = _tower_sites(turn)
+    missing = set(_unbuilt_rocket_sites(turn))
+    if not missing:
+        return
+    slots = min(turn.gold // WEAPON_BUILD_COST, max(0, 3 - len(turn.weapons())))
+    committed = len(turn.weapons())
+    for role in turn.workers():
+        if slots <= 0:
+            break
+        if _must_leave_stand(turn, role) or role.pos in missing:
+            continue
+        chosen: tuple[int, Pos] | None = None
+        for index, site in enumerate(sites):
+            if site not in missing or site in _PLANNED_BUILDS:
+                continue
+            if committed < 2 and index >= 2:
+                continue
+            if role.pos != site and distance(role.pos, site) <= 1:
+                chosen = (index, site)
+                break
+        if chosen is None:
+            continue
+        _index, site = chosen
+        _PLANNED_BUILDS[site] = role.unit_id
+        claimed.add(site)
+        missing.discard(site)
+        committed += 1
+        slots -= 1
+
+
+def _assign_rocket_move(
+    turn: World,
+    role: Unit,
+    site: Pos,
+    step: Pos,
+    index: int,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    memory,
+) -> None:
+    claimed.add(step)
+    commands[role.unit_id] = move_command(step)
+    _block_record(role.unit_id).pending_goal = site
+    _keep_job(
+        memory, role, KIND_TOWER, target=site,
+        name=TOWER_LOADOUT[index] if index < len(TOWER_LOADOUT) else "rocket",
+        round_no=turn.round_no,
+    )
+
+
+def _best_rocket_move(
+    turn: World,
+    role: Unit,
+    sites: tuple[Pos, ...],
+    missing: list[Pos],
+    claimed: set[Pos],
+    memory,
+    *,
+    committed: int,
+) -> tuple[Pos, Pos, int] | None:
+    """挑一门走得到、没被别人占的炮。最近那门走不到时改去另一门。"""
+    taken = claimed_targets(memory, role.unit_id)
+    job = get_job(memory, role.unit_id)
+    own = job.target if job is not None and job.kind == KIND_TOWER else None
+    ranked: list[tuple[int, int, int, int, Pos, Pos]] = []
+    blocked_near: tuple[int, Pos] | None = None
+    for index, site in enumerate(sites):
+        if site not in missing or site in claimed:
+            owner = _PLANNED_BUILDS.get(site)
+            if not (owner == role.unit_id and site in missing):
+                continue
+        owner = _PLANNED_BUILDS.get(site)
+        if owner is not None and owner != role.unit_id:
+            continue
+        if site in taken and site != own:
+            continue
+        if _outer_build_failed(turn, role, missing) and site == _outer_site(turn):
+            continue
+        approaches = _rocket_approaches(turn, role, site, claimed)
+        adjacent = (
+            role.pos != site
+            and distance(role.pos, site) <= 1
+            and not _must_leave_stand(turn, role)
+        )
+        if not approaches and not adjacent:
+            cheby = distance(role.pos, site)
+            if blocked_near is None or (cheby, site.x, site.y) < (
+                blocked_near[0], blocked_near[1].x, blocked_near[1].y,
+            ):
+                blocked_near = (cheby, site)
+            continue
+        step = role.pos if adjacent and not approaches else approaches[0][1]
+        if not adjacent and (not approaches or step in claimed or step == role.pos):
+            continue
+        cost = 0 if adjacent else approaches[0][0]
+        sticky = 0 if site == own and (approaches or adjacent) else 1
+        wait_rank = 1 if committed < 2 and index >= 2 else 0
+        ranked.append((sticky, wait_rank, cost, index, site, step))
+    if not ranked:
+        if blocked_near is not None:
+            _note_cannot_reach(turn, role, blocked_near[1])
+        return None
+    ranked.sort()
+    if blocked_near is not None and blocked_near[0] <= distance(role.pos, ranked[0][4]):
+        _note_cannot_reach(turn, role, blocked_near[1])
+    _sticky, _wait, _cost, index, site, step = ranked[0]
+    return site, step, index
 
 
 def _nudge_toward_rocket(
@@ -224,54 +470,65 @@ def _nudge_toward_rocket(
     commands: dict[int, dict[str, Any]],
     memory,
 ) -> bool:
-    """首选落脚点被占时,仍朝缺的火箭迈出一格,不能原地空过。"""
+    """落脚点被占时改去另一门炮或空邻格，不能空过，也不要朝走不到的炮越走越远。"""
     if not missing:
         return False
-    anchor = min(missing, key=lambda site: (distance(role.pos, site), site.x, site.y))
-    changed, step = reroute_if_blocked_two_turns(
-        turn, role, anchor, claimed, set(missing), commands,
+    sites = _tower_sites(turn)
+    committed = len(turn.weapons()) + sum(
+        1 for command in commands.values()
+        if command.get("action") == "build" and command.get("name") in TOWER_TYPES
     )
-    if changed:
-        if step is None or step in claimed:
-            return False
-        claimed.add(step)
-        commands[role.unit_id] = move_command(step)
-        _block_record(role.unit_id).pending_goal = anchor
-        _keep_job(
-            memory, role, KIND_TOWER, target=anchor, name="rocket",
-            round_no=turn.round_no,
+    picked = _best_rocket_move(
+        turn, role, sites, missing, claimed, memory, committed=committed,
+    )
+    if picked is not None and picked[1] != role.pos:
+        site, step, index = picked
+        _assign_rocket_move(
+            turn, role, site, step, index, claimed, commands, memory,
         )
         return True
-    stand = _gun_stand(turn)
-
-    def options(extra: set[Pos]) -> list[Pos]:
-        blocked = set(turn.blocked(role))
-        blocked.update(extra)
-        if stand is not None:
-            blocked.add(stand)
-        found = []
-        for dx, dy in _NEIGHBOUR_STEPS:
-            pos = Pos(role.pos.x + dx, role.pos.y + dy)
-            if pos in claimed or pos in blocked or not turn.land(pos):
-                continue
-            found.append(pos)
-        return found
-
-    choices = options(set(missing)) or options(set())
-    blocked_steps = _block_record(role.unit_id).avoid
-    if blocked_steps:
-        kept = [pos for pos in choices if pos not in blocked_steps]
+    open_sites = [
+        site for site in missing
+        if _PLANNED_BUILDS.get(site) != role.unit_id
+        and _rocket_approaches(turn, role, site, claimed)
+    ]
+    anchors = open_sites or [
+        site for site in missing if _PLANNED_BUILDS.get(site) != role.unit_id
+    ] or list(missing)
+    avoid = _move_avoid(turn, anchors[0])
+    blocked = set(turn.blocked(role))
+    blocked.update(avoid)
+    choices: list[Pos] = []
+    for dx, dy in _NEIGHBOUR_STEPS:
+        pos = Pos(role.pos.x + dx, role.pos.y + dy)
+        if pos in claimed or pos in blocked or not turn.land(pos):
+            continue
+        choices.append(pos)
+    avoided = _block_record(role.unit_id).avoid
+    if avoided:
+        kept = [pos for pos in choices if pos not in avoided]
         if kept:
             choices = kept
     if not choices:
         return False
-    step = min(choices, key=lambda pos: (distance(pos, anchor), pos.x, pos.y))
-    claimed.add(step)
-    commands[role.unit_id] = move_command(step)
-    _block_record(role.unit_id).pending_goal = anchor
-    _keep_job(
-        memory, role, KIND_TOWER, target=anchor, name="rocket",
-        round_no=turn.round_no,
+    current = min(distance(role.pos, site) for site in anchors)
+    closer = [
+        pos for pos in choices
+        if min(distance(pos, site) for site in anchors) < current
+    ]
+    pool = closer or choices
+    step = min(
+        pool,
+        key=lambda pos: (
+            min(distance(pos, site) for site in anchors),
+            pos.x,
+            pos.y,
+        ),
+    )
+    anchor = min(anchors, key=lambda site: (distance(step, site), site.x, site.y))
+    index = next((i for i, site in enumerate(sites) if site == anchor), 0)
+    _assign_rocket_move(
+        turn, role, anchor, step, index, claimed, commands, memory,
     )
     return True
 
@@ -279,12 +536,20 @@ def _nudge_toward_rocket(
 def _ensure_opening_worker_actions(
     turn: World, memory, commands: dict[int, dict[str, Any]],
 ) -> None:
-    """三门火箭没齐之前,两名工人每回合都要 move 或 build。"""
+    """三门火箭没齐之前,两名工人每回合都要 move 或 build，而且不互相堵死。"""
     if not _opening_rockets_pending(turn):
         return
-    claimed: set[Pos] = set()
+    claimed: set[Pos] = set(_PLANNED_BUILDS)
     pending: list[Unit] = []
+    missing = _unbuilt_rocket_sites(turn)
     for role in turn.workers():
+        if _outer_build_failed(turn, role, missing):
+            command = commands.get(role.unit_id)
+            if command is not None and command.get("action") in {"move", "collect", "build"}:
+                pos = _command_cell(command)
+                if pos is not None and pos not in _PLANNED_BUILDS:
+                    claimed.add(pos)
+                continue
         command = commands.get(role.unit_id)
         if command is not None and _opening_command_ok(turn, command):
             pos = _command_cell(command)
@@ -299,7 +564,6 @@ def _ensure_opening_worker_actions(
     if not pending:
         return
     sites = _tower_sites(turn)
-    missing = _unbuilt_rocket_sites(turn)
     spent = sum(
         1 for command in commands.values()
         if command.get("action") == "build" and command.get("name") in TOWER_TYPES
@@ -400,38 +664,15 @@ def _worker_day(
                 return gold_left, builds_left
 
     # 两名工人都去建三座火箭。炮位在基地背后、靠近地图边缘:
-    # 先建前两座,前两座落地再补最外侧那座。
+    # 先建前两座,前两座落地再补最外侧那座。落脚点被占就换另一门。
     # 三塔齐后先采矿换钱、能升塔就升塔; 第 30 回合起沿圈连续砌墙。
-    num_standing_towers = _rockets_committed(turn, builds_left)
     if towers_missing and gold_left >= WEAPON_BUILD_COST and builds_left > 0:
-        for index, site in enumerate(sites):
-            if site not in towers_missing or site in claimed:
-                continue
-            if num_standing_towers < 2 and index >= 2:
-                continue
-            if (
-                _outer_build_failed(turn, role, towers_missing)
-                and site == _outer_site(turn)
-            ):
-                continue
-            if _build_or_walk(
-                turn, role, site, TOWER_LOADOUT[index], claimed, commands,
-            ):
-                if (
-                    role.unit_id in commands
-                    and commands[role.unit_id]["action"] == "build"
-                ):
-                    gold_left -= WEAPON_BUILD_COST
-                    builds_left -= 1
-                    if site in towers_missing:
-                        towers_missing.remove(site)
-                    clear_job(memory, role.unit_id)
-                else:
-                    _keep_job(
-                        memory, role, KIND_TOWER, target=site,
-                        name=TOWER_LOADOUT[index], round_no=turn.round_no,
-                    )
-                return gold_left, builds_left
+        gold_left, builds_left = _raise_pocket_towers(
+            turn, role, sites, towers_missing, claimed, commands,
+            gold_left, builds_left, memory,
+        )
+        if role.unit_id in commands:
+            return gold_left, builds_left
     shopped = _try_weapon_upgrade_shop(
         turn, role, claimed, commands, gold_left, memory,
     )
@@ -1224,11 +1465,23 @@ def _job_locked(
             and job.target == _outer_site(turn)
         ):
             return False
-        return (
-            job.target is not None
-            and job.target in towers_missing
-            and gold_left >= WEAPON_BUILD_COST
+        if (
+            job.target is None
+            or job.target not in towers_missing
+            or gold_left < WEAPON_BUILD_COST
+        ):
+            return False
+        owner = _PLANNED_BUILDS.get(job.target)
+        if owner is not None and owner != role.unit_id:
+            return False
+        beside = (
+            role.pos != job.target
+            and distance(role.pos, job.target) <= 1
+            and not _must_leave_stand(turn, role)
         )
+        if beside:
+            return True
+        return bool(_rocket_approaches(turn, role, job.target, set()))
     if job.kind == KIND_WALL:
         return bool(walls_missing) and _wall_phase(turn)
     if job.kind in {KIND_SHOP, KIND_SELL, KIND_RECALL}:
@@ -1496,39 +1749,47 @@ def _raise_pocket_towers(
     builds_left: int,
     memory,
 ) -> tuple[int, int]:
-    """只建口袋里还缺的火箭。先两门,再补最外侧。金币已够就不再先去采矿。"""
-    num_standing_towers = _rockets_committed(turn, builds_left)
+    """只建口袋里还缺的火箭。落脚点被占就换一门，不和别人挤同一格。"""
+    committed = _rockets_committed(turn, builds_left)
     if not towers_missing or gold_left < WEAPON_BUILD_COST or builds_left <= 0:
         return gold_left, builds_left
     for index, site in enumerate(sites):
-        if site not in towers_missing or site in claimed:
+        if site not in towers_missing:
             continue
-        if num_standing_towers < 2 and index >= 2:
+        if committed < 2 and index >= 2:
             continue
-        if (
-            _outer_build_failed(turn, role, towers_missing)
-            and site == _outer_site(turn)
-        ):
+        owner = _PLANNED_BUILDS.get(site)
+        if owner is not None and owner != role.unit_id:
             continue
-        if not _build_or_walk(
-            turn, role, site, TOWER_LOADOUT[index], claimed, commands,
-        ):
+        if _outer_build_failed(turn, role, towers_missing) and site == _outer_site(turn):
             continue
-        if (
-            role.unit_id in commands
-            and commands[role.unit_id]["action"] == "build"
-        ):
-            gold_left -= WEAPON_BUILD_COST
-            builds_left -= 1
-            if site in towers_missing:
-                towers_missing.remove(site)
-            clear_job(memory, role.unit_id)
-        else:
-            _keep_job(
-                memory, role, KIND_TOWER, target=site,
-                name=TOWER_LOADOUT[index], round_no=turn.round_no,
-            )
+        beside = (
+            role.pos != site
+            and distance(role.pos, site) <= 1
+            and not _must_leave_stand(turn, role)
+        )
+        if not beside:
+            continue
+        if site in claimed and owner != role.unit_id:
+            continue
+        commands[role.unit_id] = build_command(site, TOWER_LOADOUT[index])
+        claimed.add(site)
+        _PLANNED_BUILDS[site] = role.unit_id
+        gold_left -= WEAPON_BUILD_COST
+        builds_left -= 1
+        if site in towers_missing:
+            towers_missing.remove(site)
+        clear_job(memory, role.unit_id)
         return gold_left, builds_left
+    picked = _best_rocket_move(
+        turn, role, sites, towers_missing, claimed, memory, committed=committed,
+    )
+    if picked is None or picked[1] == role.pos:
+        return gold_left, builds_left
+    site, step, index = picked
+    _assign_rocket_move(
+        turn, role, site, step, index, claimed, commands, memory,
+    )
     return gold_left, builds_left
 
 
@@ -1935,6 +2196,9 @@ def _walk_onto(
         return True
     travel = set(avoid or ())
     travel.update(_block_record(role.unit_id).avoid)
+    travel.update(_move_avoid(turn, target))
+    if target not in _tower_sites(turn):
+        travel.discard(target)
     changed, step = reroute_if_blocked_two_turns(
         turn, role, target, claimed, travel, commands,
     )
@@ -2422,6 +2686,68 @@ def _controller_ids(commands: dict[int, dict[str, Any]]) -> set[int]:
     return ids
 
 
+def _issued_cells(commands: dict[int, dict[str, Any]]) -> set[Pos]:
+    cells: set[Pos] = set()
+    for command in commands.values():
+        pos = _command_cell(command)
+        if pos is not None and command.get("action") in {"move", "build"}:
+            cells.add(pos)
+    return cells
+
+
+def _untangle_feet(turn: World, memory, commands: dict[int, dict[str, Any]]) -> None:
+    """同一回合不能一个人 build、另一个人 move 进同一格。开拓者白天不踩炮位。"""
+    rockets = set(_tower_sites(turn))
+    stand = _gun_stand(turn)
+    build_cells: dict[Pos, int] = {}
+    for uid, command in commands.items():
+        if command.get("action") != "build":
+            continue
+        cell = _command_cell(command)
+        if cell is None:
+            continue
+        build_cells[cell] = int(uid)
+        _PLANNED_BUILDS.setdefault(cell, int(uid))
+    roles = {role.unit_id: role for role in turn.controllable()}
+    for uid, command in list(commands.items()):
+        if command.get("action") != "move":
+            continue
+        step = _command_cell(command)
+        role = roles.get(int(uid))
+        if step is None or role is None:
+            continue
+        on_build = step in build_cells and build_cells[step] != int(uid)
+        on_pocket = step in rockets or (stand is not None and step == stand)
+        if role.kind == "pioneer":
+            answering = _pioneer_on_evolution(turn, role, memory) or _just_accepted(
+                turn, role, memory,
+            )
+            if answering or not turn.is_day or _in_recall(turn):
+                if on_build:
+                    commands.pop(int(uid), None)
+                continue
+            if not on_build and not on_pocket:
+                continue
+            commands.pop(int(uid), None)
+            claimed = _issued_cells(commands)
+            if not _try_accept_task(turn, role, claimed, commands, memory):
+                _walk_to_task(turn, role, claimed, commands)
+            continue
+        if not on_build and not (turn.is_day and not _in_recall(turn) and on_pocket):
+            continue
+        if _outer_build_failed(turn, role, _unbuilt_rocket_sites(turn)):
+            continue
+        commands.pop(int(uid), None)
+        if not turn.is_day or _in_recall(turn):
+            continue
+        missing = _unbuilt_rocket_sites(turn)
+        if not missing:
+            continue
+        _nudge_toward_rocket(
+            turn, role, missing, _issued_cells(commands), commands, memory,
+        )
+
+
 def _fill_idle(turn: World, memory, commands: dict[int, dict[str, Any]]) -> None:
     """真正没事做的英雄走近最近的塔,避免站桩。贴塔开火/任务点待命的不算空闲。"""
     claimed: set[Pos] = set()
@@ -2445,6 +2771,10 @@ def _fill_idle(turn: World, memory, commands: dict[int, dict[str, Any]]) -> None
         ):
             continue
         if turn.is_day and role.kind == "pioneer" and _near_own_task(turn, role):
+            continue
+        if turn.is_day and not _in_recall(turn) and role.kind == "pioneer":
+            if not _try_accept_task(turn, role, claimed, commands, memory):
+                _walk_to_task(turn, role, claimed, commands)
             continue
         if turn.is_day and not _in_recall(turn):
             if _must_leave_stand(turn, role):
@@ -2918,8 +3248,13 @@ def _build_or_walk(
         and distance(role.pos, target) <= 1
         and not _must_leave_stand(turn, role)
     ):
+        owner = _PLANNED_BUILDS.get(target)
+        if owner is not None and owner != role.unit_id:
+            return False
         commands[role.unit_id] = build_command(target, name)
         claimed.add(target)
+        if name in TOWER_TYPES:
+            _PLANNED_BUILDS[target] = role.unit_id
         return True
     step = _step_toward(turn, role, target, claimed)
     if step is not None:
@@ -2954,16 +3289,8 @@ def _step_toward(
     *,
     inside_only: bool = False,
 ) -> Pos | None:
-    # 人站上还没建成的火箭格就建不了,第二天又会被挤回站位。
-    avoid_set: set[Pos] = set()
-    if _night_shift(turn) and target != _gun_stand(turn):
-        avoid_set.update(_battery_block(turn))
-    elif _day_avoids_stand(turn):
-        stand_cell = _gun_stand(turn)
-        if stand_cell is not None and stand_cell != target:
-            avoid_set.add(stand_cell)
-        if _opening_rockets_pending(turn):
-            avoid_set.update(_unbuilt_rocket_sites(turn))
+    # 人站上还没建成的火箭格就建不了,白天也不把站位当施工落脚点。
+    avoid_set = _move_avoid(turn, target)
     rec = _block_record(role.unit_id)
     avoid_set.update(rec.avoid)
     if distance(role.pos, target) > 1:
@@ -2981,13 +3308,43 @@ def _step_toward(
             )
             return None
     avoid = avoid_set or None
+    pads = set(_tower_sites(turn))
+    if target in pads and _day_avoids_stand(turn):
+        best: tuple[int, Pos] | None = None
+        limit = distance(role.pos, target) + _DETOUR_SLACK
+        for stand in _stand_cells(turn, role, target, claimed, inside_only):
+            if stand == role.pos or stand in avoid_set or stand in pads:
+                continue
+            picked = _straight_step(turn, role, stand, avoid_set, claimed)
+            if picked is None or picked[0] > limit or picked[1] in avoid_set:
+                continue
+            cost, step = picked
+            rank = (
+                cost,
+                distance(role.pos, stand),
+                abs(stand.x - role.pos.x) + abs(stand.y - role.pos.y),
+                stand.x,
+                stand.y,
+            )
+            if best is None or rank < best[0]:
+                best = (rank, step)
+        if best is not None:
+            rec.pending_goal = target
+            claimed.add(best[1])
+            return best[1]
+        _note_direction_blocked(turn, role, target, claimed)
+        turn.note(
+            f"角色 {role.unit_id} 无法走向 ({target.x},{target.y})："
+            "周围落脚点被占、越界、或被建筑/中立单位/机器人挡住"
+        )
+        return None
     for stand in _stand_cells(turn, role, target, claimed, inside_only):
         if stand == role.pos:
             return None
         if avoid is not None and stand in avoid:
             continue
         step = next_step(turn, role, stand, avoid)
-        if step is None or step in claimed:
+        if step is None or step in claimed or step in avoid_set:
             continue
         rec.pending_goal = target
         claimed.add(step)
