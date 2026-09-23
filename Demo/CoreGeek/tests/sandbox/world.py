@@ -1,4 +1,4 @@
-"""私有单回合沙箱:用 teamB 日志编 defender 地图,供 decide() 单测。
+"""私有单回合沙箱:固定 defender 地图,供 decide() 单测。
 
 约定(与用户确认过):
 - 先做单回合 payload;叠加回合状态留到后续。
@@ -31,7 +31,7 @@ GATLING = 20020
 RAILGUN = 20030
 ROCKET = 20040
 
-# teamB.log 建成的三塔
+# 沙箱地图上的三座 1 级塔（加特林/电磁/火箭，与当前三火箭开局不同）
 TOWER_SITES = {
     GATLING: ("gatling", Pos(29, 8), 3, 10),
     RAILGUN: ("railgun", Pos(29, 9), 6, 10),
@@ -215,7 +215,7 @@ def new_game() -> dict[str, Any]:
 
 
 def with_day1_towers(payload: dict[str, Any]) -> dict[str, Any]:
-    """按 teamB 开局把三座 1 级塔拍在基地西侧。"""
+    """把沙箱里的三座 1 级塔拍在基地西侧。"""
     payload = copy.deepcopy(payload)
     roles = [
         role for role in payload["teamOur"]["roles"]

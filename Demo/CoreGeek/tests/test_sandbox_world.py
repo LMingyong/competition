@@ -82,7 +82,7 @@ def test_night1_robots_not_on_buildings():
         assert pos not in heroes
 
 
-def test_night1_towers_match_teamb_log():
+def test_night1_towers_sit_west_of_defender_base():
     payload = with_day1_towers(new_game())
     by_id = {role["id"]: role for role in payload["teamOur"]["roles"]}
     assert by_id[GATLING]["pos"] == {"x": 29, "y": 8}
