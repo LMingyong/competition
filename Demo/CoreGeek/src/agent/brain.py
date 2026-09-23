@@ -53,6 +53,7 @@ from .tasks import (
     missing_treasure_items,
     next_task_command,
     observe,
+    should_ask_model,
     task_prompt,
     treasure_prompt,
     treasure_ready,
@@ -768,11 +769,11 @@ def _pioneer_day(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
 ) -> tuple[str, str]:
-    if _try_heal(role, commands):
-        return "", _maybe_prompt(turn, memory)
     if turn.phase_task:
         _keep_job(memory, role, KIND_PHASE, round_no=turn.round_no)
         return _run_task(turn, role, memory, claimed, commands)
+    if _try_heal(role, commands):
+        return "", _maybe_prompt(turn, memory)
     if _should_home(turn, role, memory):
         _keep_job(
             memory, role, KIND_RECALL, target=_recall_target(turn),
@@ -812,15 +813,24 @@ def _run_task(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
 ) -> tuple[str, str]:
+    step_before = memory.task_step
+    last_before = memory.last_execute
+    wait_before = memory.model_wait
     execute_cmd, answer = next_task_command(turn, memory)
     if answer:
         commands[role.unit_id] = submit_answer_command(answer)
-        execute_cmd = ""
+        if not _near_own_task(turn, role):
+            execute_cmd = ""
     elif not _near_own_task(turn, role):
+        # 人还没站到任务点，这条沙盒命令发不出去，不能把一次性求解的进度记掉。
+        memory.task_step = step_before
+        memory.last_execute = last_before
+        memory.model_wait = wait_before
         _walk_to_task(turn, role, claimed, commands)
         execute_cmd = ""
     prompt = ""
-    if can_prompt(turn, memory):
+    moving = commands.get(role.unit_id, {}).get("action") == "move"
+    if should_ask_model(turn, execute_cmd, answer) and not moving:
         prompt = task_prompt(turn)
         mark_prompt(turn, memory)
     return execute_cmd, prompt
@@ -933,11 +943,8 @@ def _night(
             execute_cmd, answer = next_task_command(turn, memory)
             if answer:
                 commands[pioneer.unit_id] = submit_answer_command(answer)
-                busy.add(pioneer.unit_id)
                 execute_cmd = ""
-            if can_prompt(turn, memory):
-                prompt = task_prompt(turn)
-                mark_prompt(turn, memory)
+            # 不把开拓者标成忙碌：黑夜必须继续操塔。任务 prompt 也不发，避免 503 丢掉开火。
     for role in turn.controllable():
         if role.unit_id in busy:
             continue
