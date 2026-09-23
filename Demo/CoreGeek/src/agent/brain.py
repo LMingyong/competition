@@ -179,9 +179,10 @@ def _worker_day(
 
     # 09:00 逻辑:两名工人都去建塔/走近塔,不按 builder/miner 拆开。
     # 优先建前两个塔位，第三个只有在前面两个都满了之后才建。
+    # committed = 已落地 + 本回合刚 build,第二门当回合建完另一人去第三门。
     # 三塔齐后先采矿换钱、能升塔就升塔; 第 30 回合起砌墙,第一天把墙建齐。
     # 建完后升级顺序:武器 > 朝向敌人的围墙(从地图中心向外) > 其余围墙 > 基地。
-    num_standing_towers = len(turn.weapons())
+    num_standing_towers = len(turn.weapons()) + _tower_builds_this_turn(commands)
     if towers_missing and gold_left >= WEAPON_BUILD_COST and builds_left > 0:
         for index, site in enumerate(sites):
             if site not in towers_missing or site in claimed:
@@ -989,18 +990,74 @@ def _fill_idle(turn: World, memory, commands: dict[int, dict[str, Any]]) -> None
     """真正没事做的英雄走近最近的塔,避免站桩。贴塔开火/任务点待命的不算空闲。"""
     claimed: set[Pos] = set()
     for command in commands.values():
-        if command.get("action") != "move":
+        if command.get("action") not in {"move", "build"}:
             continue
-        raw = (command.get("targetPos") or [None])[0]
-        if isinstance(raw, dict):
-            claimed.add(Pos.load(raw))
+        cell = _command_cell(command)
+        if cell is not None:
+            claimed.add(cell)
     busy = set(commands) | _controller_ids(commands)
+    sites = _tower_sites(turn) if turn.is_day else ()
+    standing = {unit.pos for unit in turn.weapons()}
+    committed = set(standing)
+    for command in commands.values():
+        cell = _command_cell(command)
+        if (
+            cell is not None
+            and command.get("action") == "build"
+            and str(command.get("name") or "") in TOWER_TYPES
+        ):
+            committed.add(cell)
+    gold_left = turn.gold - WEAPON_BUILD_COST * _tower_builds_this_turn(commands)
     for role in turn.controllable():
         if role.unit_id in busy:
             continue
-        if any(distance(role.pos, tower.pos) <= 1 for tower in turn.weapons()):
+        job = get_job(memory, role.unit_id)
+        if (
+            job is not None
+            and job.kind == KIND_MINE
+            and job.target is not None
+            and not role.backpack_full
+            and turn.adjacent_to_zone(role, job.target)
+        ):
+            commands[role.unit_id] = collect_command(job.target)
+            claimed.add(job.target)
             continue
+        if (
+            turn.is_day
+            and role.kind == "worker"
+            and sites
+            and len(committed) < len(sites)
+            and gold_left >= WEAPON_BUILD_COST
+        ):
+            taken = claimed_targets(memory, role.unit_id)
+            for index, site in enumerate(sites):
+                if site in committed or site in claimed or site in taken:
+                    continue
+                if len(committed) < 2 and index >= 2:
+                    continue
+                if _build_or_walk(
+                    turn, role, site, TOWER_LOADOUT[index], claimed, commands,
+                ):
+                    if (
+                        role.unit_id in commands
+                        and commands[role.unit_id]["action"] == "build"
+                    ):
+                        committed.add(site)
+                        gold_left -= WEAPON_BUILD_COST
+                    else:
+                        _keep_job(
+                            memory, role, KIND_TOWER, target=site,
+                            name=TOWER_LOADOUT[index], round_no=turn.round_no,
+                        )
+                    break
+            if role.unit_id in commands:
+                continue
         if turn.is_day and role.kind == "pioneer" and _near_own_task(turn, role):
+            continue
+        if (
+            any(distance(role.pos, tower.pos) <= 1 for tower in turn.weapons())
+            and (not turn.is_day or len(committed) >= len(sites))
+        ):
             continue
         _recall_to_tower(turn, role, claimed, commands)
 
@@ -1363,6 +1420,14 @@ def _mine(
                 return (vendor, "sell")
             return None
         return None
+    failed = turn.last_ok(role.unit_id) is False
+    if not failed:
+        stuck = _adjacent_mine(turn, role)
+        if stuck is not None:
+            kind = dict(turn.all_mines()).get(stuck, "")
+            commands[role.unit_id] = collect_command(stuck)
+            claimed.add(stuck)
+            return (stuck, kind)
     ranked = sorted(
         (
             (pos, kind) for pos, kind in turn.all_mines()
@@ -1375,7 +1440,6 @@ def _mine(
             item[0].y,
         ),
     )
-    failed = turn.last_ok(role.unit_id) is False
     for pos, kind in ranked:
         if failed and distance(role.pos, pos) <= 1:
             continue
@@ -1383,6 +1447,27 @@ def _mine(
         if _execute_mine(turn, role, job, claimed, commands):
             return (pos, kind)
     return None
+
+
+def _command_cell(command: dict[str, Any]) -> Pos | None:
+    raw = (command.get("targetPos") or [None])[0]
+    if isinstance(raw, dict):
+        return Pos.load(raw)
+    return None
+
+
+def _tower_builds_this_turn(commands: dict[int, dict[str, Any]]) -> int:
+    return sum(
+        1
+        for command in commands.values()
+        if command.get("action") == "build"
+        and str(command.get("name") or "") in TOWER_TYPES
+    )
+
+
+def _unbuilt_tower_tiles(turn: World) -> set[Pos]:
+    standing = {unit.pos for unit in turn.weapons()}
+    return {pos for pos in _tower_sites(turn) if pos not in standing}
 
 
 def _build_or_walk(
@@ -1400,6 +1485,7 @@ def _build_or_walk(
     step = _step_toward(turn, role, target, claimed)
     if step is not None:
         commands[role.unit_id] = move_command(step)
+        claimed.add(target)
         return True
     return False
 
@@ -1412,7 +1498,7 @@ def _walk_adjacent(
     commands: dict[int, dict[str, Any]],
 ) -> bool:
     if role.pos != target and distance(role.pos, target) <= 1:
-        return False
+        return True
     step = _step_toward(turn, role, target, claimed)
     if step is None:
         return False
@@ -1428,11 +1514,12 @@ def _step_toward(
     *,
     inside_only: bool = False,
 ) -> Pos | None:
-    for stand in _stand_cells(turn, role, target, claimed, inside_only):
+    reserved = claimed | _unbuilt_tower_tiles(turn)
+    for stand in _stand_cells(turn, role, target, reserved, inside_only):
         if stand == role.pos:
             return None
         step = next_step(turn, role, stand)
-        if step is None or step in claimed:
+        if step is None or step in reserved:
             continue
         claimed.add(step)
         return step
