@@ -108,59 +108,106 @@ def park_other_worker_building(payload: dict[str, Any]) -> None:
     place(payload, WORKER_2, 12, 21, backpack=["stone", "stone", "stone", "stone"])
 
 
-def _zone_kind(payload: dict[str, Any], x: int, y: int) -> str | None:
-    for zone in payload.get("mapInfo", {}).get("zones") or ():
-        pos = zone.get("pos") or {}
-        if int(pos.get("x") or 0) == x and int(pos.get("y") or 0) == y:
-            return str(zone.get("neutralType") or "") or None
-    return None
+def _hero_roles(payload: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    return {
+        role["id"]: role
+        for role in payload["teamOur"]["roles"]
+        if role.get("roleType") in ("worker", "pioneer")
+    }
 
 
-def apply_turn(
-    payload: dict[str, Any],
-    response: dict[str, Any],
-    *,
-    next_round: bool = True,
-) -> dict[str, Any]:
-    """把本回合指令写回下一帧,禁止用 place 瞬移冒充多回合。
+def _weapon_roles(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        role for role in payload["teamOur"]["roles"]
+        if role.get("roleType") in TOWER_KINDS
+    ]
 
-    move 改坐标;非墙 build 扣 25 金并 append 武器;collect 进背包;
-    lastRoundRoleActionResults 记下本回合有指令的角色。
+
+def apply_turn(payload: dict[str, Any], commands: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """把上回合合法指令写回下一帧：坐标、金币、武器、背包、lastRoundRoleActionResults。
+
+    只改 roundNo 或瞬移不算连续回合。move 必须邻格且可走才写回坐标；
+    非墙 build 扣 25 金并把武器 append 进 roles；collect 把矿名放进背包。
     """
+    world = World.load(payload)
+    occupied = {unit.pos for unit in world.ours if unit.health > 0}
+    heroes = _hero_roles(payload)
+    mines = dict(world.all_mines())
     results: dict[str, bool] = {}
-    for key, command in response.items():
-        unit_id = int(key)
+    next_id = 70000 + int(payload.get("roundNo") or 0) * 10
+    for key, command in sorted(commands.items(), key=lambda item: int(item[0])):
+        uid = int(key)
+        role = heroes.get(uid)
         action = command.get("action")
-        results[str(unit_id)] = True
+        if role is None:
+            results[key] = action in {"attack", "remove"}
+            continue
+        cur = Pos(int(role["pos"]["x"]), int(role["pos"]["y"]))
+        unit = next((item for item in world.ours if item.unit_id == uid), None)
+        ok = False
         if action == "move":
-            raw = command["targetPos"][0]
-            role = role_by_id(payload, unit_id)
-            role["pos"] = {"x": int(raw["x"]), "y": int(raw["y"])}
-        elif action == "build":
-            name = str(command.get("name") or "")
-            if name == "wall":
-                continue
-            raw = command["targetPos"][0]
-            gold = int(payload["teamOur"].get("goldNum") or 0)
-            payload["teamOur"]["goldNum"] = gold - 25
-            payload["teamOur"]["roles"].append(
-                {
-                    "id": 50000 + len(payload["teamOur"]["roles"]),
-                    "pos": {"x": int(raw["x"]), "y": int(raw["y"])},
-                    "roleType": name,
-                    "health": 1000,
-                    "level": 1,
-                    "attackPower": 20 if name == "rocket" else 10,
-                    "attackRange": 10,
-                    "backpack": [],
-                }
-            )
+            raw = (command.get("targetPos") or [None])[0]
+            dest = Pos(int(raw["x"]), int(raw["y"])) if isinstance(raw, dict) else None
+            blocked = set(world.blocked(unit)) if unit is not None else set()
+            others = set(occupied) - {cur}
+            if (
+                dest is not None
+                and unit is not None
+                and dest not in blocked
+                and dest not in others
+                and world.land(dest)
+                and distance(cur, dest) == 1
+                and dest != cur
+            ):
+                role["pos"] = dest.dump()
+                occupied.discard(cur)
+                occupied.add(dest)
+                ok = True
+        elif action == "build" and command.get("name") != "wall":
+            raw = (command.get("targetPos") or [None])[0]
+            target = Pos(int(raw["x"]), int(raw["y"])) if isinstance(raw, dict) else None
+            occ = World.load(payload).occupied_for_build()
+            if (
+                target is not None
+                and role.get("roleType") == "worker"
+                and cur != target
+                and distance(cur, target) <= 1
+                and target not in occ
+                and payload["teamOur"]["goldNum"] >= WEAPON_BUILD_COST
+                and len(_weapon_roles(payload)) < 3
+            ):
+                payload["teamOur"]["goldNum"] -= WEAPON_BUILD_COST
+                payload["teamOur"]["roles"].append(
+                    {
+                        "id": next_id + target.x * 40 + target.y,
+                        "pos": target.dump(),
+                        "roleType": command.get("name") or "rocket",
+                        "health": 1000,
+                        "level": 1,
+                        "attackPower": 20,
+                        "attackRange": 10,
+                        "backpack": [],
+                    }
+                )
+                ok = True
         elif action == "collect":
-            raw = command["targetPos"][0]
-            kind = _zone_kind(payload, int(raw["x"]), int(raw["y"]))
-            if kind:
-                role_by_id(payload, unit_id)["backpack"].append(kind)
+            raw = (command.get("targetPos") or [None])[0]
+            target = Pos(int(raw["x"]), int(raw["y"])) if isinstance(raw, dict) else None
+            kind = mines.get(target) if target is not None else None
+            if (
+                target is not None
+                and kind
+                and cur != target
+                and distance(cur, target) <= 1
+            ):
+                role.setdefault("backpack", []).append(kind)
+                ok = True
+        elif action in {
+            "sell", "buy", "acceptTask", "submitAnswer", "summonTreasure",
+            "use", "drop", "attack", "remove",
+        }:
+            ok = True
+        results[key] = ok
     payload["lastRoundRoleActionResults"] = results
-    if next_round:
-        payload["roundNo"] = int(payload["roundNo"]) + 1
+    payload["roundNo"] = int(payload.get("roundNo") or 1) + 1
     return payload

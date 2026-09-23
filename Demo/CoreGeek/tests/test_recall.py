@@ -244,7 +244,7 @@ def test_ready_answer_submits_while_standing_on_task(make_payload):
     """题面里的 API 结果就绪后 submitAnswer，人留在任务点。"""
     from agent.debuglog import last_extra
 
-    phase = "请阅读task_1_beijing.md，获取任务信息"
+    phase = "请阅读task_9_custom.md，获取任务信息"
     question = (
         "查询全部文化遗产。接口 http://localhost:8899/heritage 。"
         "提交 {city, total_count, world_heritage_count, types, oldest_era}。"
@@ -258,7 +258,14 @@ def test_ready_answer_submits_while_standing_on_task(make_payload):
     first = decide(reading)
     _validate(first, reading)
     assert action_of(first, PIONEER) != "move"
-    assert "localhost:8899" in last_extra()["executeCmd"]
+    execute = last_extra()["executeCmd"]
+    shown = execute
+    marker = "b64decode('"
+    if marker in execute:
+        import base64
+        payload = execute.split(marker, 1)[1].split("')", 1)[0]
+        shown = base64.b64decode(payload).decode("utf-8")
+    assert "localhost:8899" in shown
 
     answering = fresh(make_payload(
         roundNo=21,

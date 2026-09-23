@@ -4,6 +4,7 @@ import base64
 import json
 import re
 from dataclasses import dataclass, field
+from urllib.parse import quote
 
 from .jobs import Job, update_fail_streaks
 from .protocol import Pos, Unit
@@ -89,11 +90,17 @@ class Memory:
     task_file: str = ""
     task_dir: str = ""
     task_body: str = ""
+    task_fails: int = 0
+    abandon_task: bool = False
     api_fetched: bool = False
+    saw_workspace: bool = False
+    accepted_round: int = 0
     api_blob: str = ""
     bundle_kind: str = ""
     model_wait: int = 0
     last_execute: str = ""
+    learn_key: str = ""
+    sops: list = field(default_factory=list)
     jobs: dict[int, Job] = field(default_factory=dict)
     roles: dict[int, str] = field(default_factory=dict)
     ticket_owner: dict[int, str] = field(default_factory=dict)
@@ -114,6 +121,7 @@ def observe(turn: World) -> Memory:
         memory.pending_answer = ""
         memory.task_file = ""
         memory.task_dir = ""
+        memory.sops.clear()
         _clear_task_detail(memory)
         memory.jobs.clear()
         memory.roles.clear()
@@ -191,6 +199,11 @@ def _clear_task_detail(memory: Memory) -> None:
     memory.bundle_kind = ""
     memory.model_wait = 0
     memory.last_execute = ""
+    memory.learn_key = ""
+    memory.task_fails = 0
+    memory.abandon_task = False
+    memory.saw_workspace = False
+    memory.accepted_round = 0
 
 
 def task_prompt(turn: World) -> str:
@@ -202,18 +215,24 @@ def task_prompt(turn: World) -> str:
     if len(raw) > 7000:
         raw = raw[:800] + "\n...\n" + raw[-6200:]
     return (
-        "你是比赛内嵌的自进化求解模型。沙盒无外网，时限15秒，只能访问 "
-        "/tmp/selfEvolutionTask 和 localhost。"
-        f"禁止 find -name 使用中文或「请阅读」整句。列文件用 find /tmp/selfEvolutionTask -name '*.md'，"
-        f"再读取 {hint}。"
-        "若输出里已有符合题面字段的 JSON，把该 JSON 原样写入 taskAnswer，executeCmd 留空。"
-        "文化遗产题按城市筛选后统计 total_count、world_heritage_count、types、oldest_era，"
-        "不要提交原始记录列表。"
-        "工程修复题（spec.md、./check、ws_）：executeCmd 写一段 python，按 spec 修改文件并再跑 ./check。"
-        "检查已通过时，按题面给出 taskAnswer，executeCmd 留空。"
-        "不要把目录列表、MISSING、文件路径或题面原文当成 taskAnswer。"
-        "只输出一行 JSON："
-        '{"executeCmd":"","taskAnswer":""}。'
+        "你在为《未来战争》自进化任务生成可复用流程。沙盒无外网，Python 3.11，"
+        "时限15秒，只能访问 /tmp/selfEvolutionTask 和 localhost。"
+        "禁止 find -name 使用中文或「请阅读」整句。"
+        f"列文件用 find /tmp/selfEvolutionTask -name '*.md'，再读取 {hint}。"
+        "只输出一行 JSON，不要解释："
+        '{"family":"http_get|json_aggregate|file_patch|script",'
+        '"recognize":"题面里能认出这一族的短句",'
+        '"url":"带{参数}的localhost地址，没有则空字符串",'
+        '"slots":["参数名"],"answer_keys":["要提交的字段"],'
+        '"answer":"能确定的最终答案，否则空字符串",'
+        '"taskAnswer":"与answer相同",'
+        '"executeCmd":"仅四族都套不上时给一条命令，否则空字符串",'
+        '"script":"仅family=script时给Python3.11源码，用{参数}占位"}。'
+        "http_get 只访问 localhost 或 127.0.0.1。"
+        "json_aggregate 按题面字段统计，不要提交原始记录列表。"
+        "file_patch 表示按 spec.md 修改后运行 ./check，token 以检查输出为准。"
+        "不要把目录列表、MISSING、文件路径或题面原文当成 answer。"
+        "同一种题后面只会更换 slots 里的参数。"
         f"\n【任务】\n{turn.phase_task}\n【题面】\n{shown}\n【上次命令输出】\n{raw}"
     )
 
@@ -241,10 +260,209 @@ def llm_unavailable(turn: World) -> bool:
 
 
 def should_ask_model(turn: World, execute: str, answer: str) -> bool:
-    """本地已经有命令或答案时不发 prompt，避免 LLM 503 把整回合决策丢掉。"""
-    if execute or answer or llm_unavailable(turn):
+    """题面已读到、还没有可套用流程、且模型可用时提问。
+
+    沙箱命令可以和 prompt 同一回合发出。没有题面、已经有答案、
+    这一题已经问过、或上一回合模型 503 时不再问，避免空等慢模型。
+    """
+    del execute
+    if answer or not turn.phase_task:
         return False
-    return bool(turn.phase_task)
+    if llm_unavailable(turn):
+        MEMORY.learn_key = ""
+        return False
+    body = (MEMORY.task_body or "").strip()
+    if not body:
+        return False
+    if _sop_for(MEMORY, body) is not None:
+        return False
+    if MEMORY.learn_key == _learn_key(body):
+        return False
+    return True
+
+
+def note_task_prompt(memory: Memory) -> None:
+    """记下这一题已经问过模型，同题面不再重复提问。"""
+    memory.learn_key = _learn_key(memory.task_body)
+
+
+def _learn_key(text: str) -> str:
+    return (text or "").strip()[:240]
+
+
+def _remember_sop(data: dict, memory: Memory) -> None:
+    """把模型交回的流程存下来。同一族只留一份，供后面的题填参数。"""
+    if not data:
+        return
+    family = str(data.get("family") or "")
+    url = str(data.get("url") or "")
+    script = str(data.get("script") or "")
+    raw_keys = data.get("answer_keys") or []
+    raw_slots = data.get("slots") or []
+    if not isinstance(raw_keys, list):
+        raw_keys = []
+    if not isinstance(raw_slots, list):
+        raw_slots = []
+    keys = [str(item) for item in raw_keys if str(item)]
+    if family not in {"http_get", "json_aggregate", "file_patch", "script"}:
+        if url:
+            family = "http_get"
+        elif script:
+            family = "script"
+        elif any(key in {"total_count", "oldest_era", "world_heritage_count"} for key in keys):
+            family = "json_aggregate"
+        else:
+            return
+    sop = {
+        "family": family,
+        "recognize": str(data.get("recognize") or "")[:80],
+        "url": url,
+        "slots": [str(item) for item in raw_slots if str(item)],
+        "answer_keys": keys,
+        "script": script if family == "script" else "",
+    }
+    if family == "http_get" and not sop["url"]:
+        return
+    if family == "script" and (not sop["script"] or _script_rejected(sop["script"])):
+        return
+    if family == "file_patch" and not sop["recognize"]:
+        sop["recognize"] = "spec.md"
+    signature = (
+        sop["family"], sop["url"], tuple(sop["answer_keys"]), sop["recognize"],
+    )
+    for old in memory.sops:
+        old_sig = (
+            old.get("family"), old.get("url"),
+            tuple(old.get("answer_keys") or []), old.get("recognize"),
+        )
+        if old_sig == signature:
+            return
+    memory.sops.append(sop)
+
+
+def _sop_for(memory: Memory, task_body: str) -> dict | None:
+    text = task_body or ""
+    if not text:
+        return None
+    keys = _schema_keys(text)
+    for sop in reversed(memory.sops):
+        recognize = str(sop.get("recognize") or "")
+        if recognize and recognize in text:
+            return sop
+        sop_keys = [str(item) for item in sop.get("answer_keys") or []]
+        if keys and sop_keys and keys == sop_keys:
+            return sop
+        url = str(sop.get("url") or "")
+        host = re.search(r"https?://[^/\s]+", url)
+        if host and host.group(0) in text:
+            return sop
+        if sop.get("family") == "file_patch" and any(
+            token in text for token in ("./check", "spec.md", "ws_")
+        ):
+            return sop
+    return None
+
+
+def _slot_value(slot: str, task_body: str) -> str:
+    text = task_body or ""
+    name = slot.lower()
+    if name in {"city", "城市"}:
+        city = _city_wanted(text)
+        if city:
+            return city
+    match = re.search(
+        rf"{re.escape(slot)}\s*[:：=]\s*([^\s,，。]+)", text, re.I,
+    )
+    if match:
+        return match.group(1).strip("'\"")
+    if name in {"city", "q", "query", "name"}:
+        found = re.search(r"查询([\u4e00-\u9fffA-Za-z0-9_]{1,16})", text)
+        if found:
+            value = found.group(1)
+            for suffix in ("天气", "的"):
+                if value.endswith(suffix):
+                    value = value[: -len(suffix)]
+            if value:
+                return value
+    return ""
+
+
+def _fill_template(template: str, slots: list, task_body: str) -> str:
+    if not template:
+        return ""
+    filled = template
+    for slot in slots:
+        value = _slot_value(str(slot), task_body)
+        if not value:
+            return ""
+        filled = filled.replace("{" + str(slot) + "}", quote(value, safe=""))
+    if re.search(r"\{[A-Za-z_][A-Za-z0-9_]*\}", filled):
+        return ""
+    return filled
+
+
+def _script_rejected(script: str) -> bool:
+    if not script or len(script) > 8000:
+        return True
+    if re.search(r"https?://(?!(?:localhost|127\.0\.0\.1)\b)", script):
+        return True
+    lowered = script.lower()
+    if "pip " in lowered or "pip\n" in lowered:
+        return True
+    return False
+
+
+def _script_cmd(sop: dict, task_body: str) -> str:
+    script = str(sop.get("script") or "")
+    if _script_rejected(script):
+        return ""
+    for slot in sop.get("slots") or []:
+        value = _slot_value(str(slot), task_body)
+        if not value:
+            return ""
+        script = script.replace("{" + str(slot) + "}", value)
+    if _script_rejected(script):
+        return ""
+    return _python_cmd(script, "sop-script")
+
+
+def _apply_sop(memory: Memory, turn: World) -> tuple[str, str] | None:
+    """用已学会的流程做当前题。套不上返回 None，交给原来的沙箱探测。"""
+    sop = _sop_for(memory, memory.task_body)
+    if not sop:
+        return None
+    family = sop.get("family")
+    slots = list(sop.get("slots") or [])
+    if family == "http_get":
+        blob = _cmd_body(turn.last_cmd_result or "")
+        answer = _ready_answer(blob, memory) if blob else ""
+        if answer:
+            return "", answer
+        url = _fill_template(str(sop.get("url") or ""), slots, memory.task_body)
+        if not url:
+            return None
+        return _api_cmd(url), ""
+    if family == "file_patch":
+        return _spec_patch_cmd(memory), ""
+    if family == "script":
+        command = _script_cmd(sop, memory.task_body)
+        if not command:
+            return None
+        return command, ""
+    if family == "json_aggregate":
+        blob = memory.api_blob or _cmd_body(turn.last_cmd_result or "")
+        answer = _ready_answer(blob, memory) if blob else ""
+        if not answer and blob:
+            parsed, _raw = _parse_json_answer(blob)
+            if parsed is not None:
+                answer = _synthesize_heritage(memory.task_body, parsed)
+        if answer:
+            return "", answer
+        url = _fill_template(str(sop.get("url") or ""), slots, memory.task_body)
+        if url:
+            return _api_cmd(url), ""
+        return None
+    return None
 
 
 def _dump_answer(payload: dict) -> str:
@@ -289,10 +507,19 @@ def next_task_command(turn: World, memory: Memory) -> tuple[str, str]:
         memory.model_wait = 0
         memory.last_execute = ""
         return "", memory.pending_answer
+    if not memory.task_body and body and not failed and _is_task_text(body):
+        memory.task_body = body.strip()
     use_model = not llm_unavailable(turn)
     parsed = parse_llm_json(turn.llm_resp) if use_model else {}
+    if use_model:
+        _remember_sop(parsed, memory)
     execute = str(parsed.get("executeCmd") or "").strip()
-    answer = _accept_model_answer(str(parsed.get("taskAnswer") or "").strip(), memory) if use_model else ""
+    raw_answer = parsed.get("taskAnswer") if use_model else ""
+    if use_model and raw_answer in (None, ""):
+        raw_answer = parsed.get("answer")
+    if isinstance(raw_answer, (dict, list)):
+        raw_answer = json.dumps(raw_answer, ensure_ascii=False)
+    answer = _accept_model_answer(str(raw_answer or "").strip(), memory) if use_model else ""
     if answer:
         memory.pending_answer = answer
     if execute:
@@ -328,28 +555,24 @@ def next_task_command(turn: World, memory: Memory) -> tuple[str, str]:
         return "", memory.pending_answer
     if memory.bundle_kind == "fix":
         return _wait_for_fix(memory)
-    if memory.bundle_kind == "pass":
-        # 检查过了却没抽出 token：再跑一次打出 ANSWER。只空等一回合给内嵌模型。
-        if memory.model_wait < 1:
-            command = _oneshot_cmd("")
-            if command == memory.last_execute:
-                command = _spec_patch_cmd(memory)
-            memory.model_wait += 1
-            memory.task_step += 1
-            memory.last_execute = command
-            return command, ""
+    if memory.bundle_kind == "pass" and memory.model_wait < 1:
+        # 检查过了却没抽出 token：再跑一次打出 ANSWER，不空等模型。
+        command = _oneshot_cmd("")
+        if command == memory.last_execute:
+            command = _spec_patch_cmd(memory)
         memory.model_wait += 1
         memory.task_step += 1
-        return "", ""
-    if (
-        memory.bundle_kind == "api"
-        and memory.api_blob
-        and not memory.api_blob.startswith("API_FAIL")
-        and memory.model_wait < 1
-    ):
-        memory.model_wait += 1
+        memory.last_execute = command
+        return command, ""
+    applied = _apply_sop(memory, turn)
+    if applied is not None:
+        command, sop_answer = applied
         memory.task_step += 1
-        return "", ""
+        memory.model_wait = 0
+        memory.last_execute = command
+        if sop_answer:
+            memory.pending_answer = sop_answer
+        return command, sop_answer
     command = _fallback_cmd(turn, memory)
     if failed and command and command == memory.last_execute:
         command = _switch_after_fail(turn, memory)
@@ -635,7 +858,7 @@ def _rewrite_sandbox_cmd(command: str, memory: Memory, turn: World) -> str:
     base = target.split("/")[-1]
     if memory.task_file and memory.task_file.endswith("/" + base):
         return f"cat {memory.task_file}"
-    return _list_md_cmd(base)
+    return _find_task_file_cmd(base)
 
 
 def _cmd_failed(raw: str) -> bool:

@@ -11,8 +11,10 @@ from agent.tasks import (
     mark_prompt,
     missing_treasure_items,
     next_task_command,
+    note_task_prompt,
     observe,
     parse_llm_json,
+    should_ask_model,
     task_prompt,
     treasure_prompt,
     treasure_ready,
@@ -466,8 +468,13 @@ def test_llm_503_uses_local_command():
     assert "base64" in execute
     assert "task_9_custom.md" in execute
     assert not should_ask_model(world, execute, answer)
-    assert should_ask_model(_world(phaseTask=phase), "", "")
+    # 题面还没读到时不问慢模型。
+    assert not should_ask_model(_world(phaseTask=phase), "", "")
+    tasks_mod.MEMORY.task_body = "查询北京天气。接口 http://127.0.0.1:8080/weather 。提交 {weather}。"
+    assert should_ask_model(_world(phaseTask=phase), "pwd", "")
+    note_task_prompt(tasks_mod.MEMORY)
     assert not should_ask_model(_world(phaseTask=phase), "pwd", "")
+    assert not should_ask_model(world, "pwd", "")
 
 
 def test_known_answer_bank_submits_immediately():
@@ -502,6 +509,68 @@ def test_known_answer_bank_submits_immediately():
         assert "base64" in execute
         assert spec["slug"] in execute
         ast.parse(_decode_script(execute))
+
+
+def test_saved_sop_fills_next_city_without_asking_again():
+    """同一族题只换参数，不再向慢模型提问。"""
+    memory = Memory(sops=[{
+        "family": "http_get",
+        "recognize": "天气",
+        "url": "http://127.0.0.1:8080/weather?city={city}",
+        "slots": ["city"],
+        "answer_keys": ["weather"],
+        "script": "",
+    }])
+    tasks_mod.MEMORY = memory
+    text = "查询广州天气。提交 {weather}。"
+    world = _world(
+        phaseTask="请阅读task_gz.md，获取任务信息",
+        lastCmdResult="[exitCode:0]\nTASK_TEXT\n" + text + "\n",
+    )
+    execute, answer = next_task_command(world, memory)
+    assert answer == ""
+    script = _decode_script(execute)
+    assert "127.0.0.1:8080" in script
+    assert "%E5%B9%BF%E5%B7%9E" in script
+    assert not should_ask_model(world, execute, answer)
+
+
+def test_llm_sop_is_kept_for_the_next_task():
+    """模型交回的流程写入记忆，换一道题后面还在。"""
+    import json
+
+    memory = Memory()
+    tasks_mod.MEMORY = memory
+    payload = {
+        "family": "http_get",
+        "recognize": "天气",
+        "url": "http://127.0.0.1:9/w?c={city}",
+        "slots": ["city"],
+        "answer_keys": ["weather"],
+        "taskAnswer": "",
+        "executeCmd": "",
+    }
+    next_task_command(_world(llmResp=json.dumps(payload, ensure_ascii=False)), memory)
+    assert memory.sops
+    assert memory.sops[0]["url"] == "http://127.0.0.1:9/w?c={city}"
+    tasks_mod.MEMORY = memory
+    observe(_world(roundNo=4, phaseTask="请阅读task_next.md"))
+    assert tasks_mod.MEMORY.sops
+    assert tasks_mod.MEMORY.learn_key == ""
+    observe(_world(roundNo=1))
+    assert tasks_mod.MEMORY.sops == []
+
+
+def test_task_prompt_asks_for_reusable_sop():
+    """提问要求的是可填空流程，不是再背一份旧题答案。"""
+    text = task_prompt(_world(
+        phaseTask="请阅读task_9_custom.md，获取任务信息",
+        lastCmdResult="[exitCode:0]\n查询天气",
+    ))
+    assert "family" in text
+    assert "slots" in text
+    assert "Python 3.11" in text
+    assert "*.md" in text
 
 
 def test_failed_sandbox_command_is_not_repeated():
